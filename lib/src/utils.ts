@@ -16,7 +16,7 @@ export function normalizeString(text: string) {
 }
 
 export const wrapWithQuotesIfNeeded = (str: string) => {
-    if (/^[a-zA-Z]\w*$/.test(str)) {
+    if (/^[A-Za-z]\w*$/.test(str)) {
         return str;
     }
 
@@ -83,7 +83,8 @@ export const escapeControlCharacters = (str: string): string => {
         .replace(/\//g, "\\/");
 };
 
-export const toBoolean = (value: undefined | string | boolean, defaultValue: boolean) => match(value)
-    .with(P.string.regex(/^false$/i), false, () => false)
-    .with(P.string.regex(/^true$/i), true, () => true)
-    .otherwise(() => defaultValue);
+export const toBoolean = (value: undefined | string | boolean, defaultValue: boolean) =>
+    match(value)
+        .with(P.string.regex(/^false$/i), false, () => false)
+        .with(P.string.regex(/^true$/i), true, () => true)
+        .otherwise(() => defaultValue);

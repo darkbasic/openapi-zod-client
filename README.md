@@ -302,15 +302,23 @@ You can do so by using the official Swagger Editor: https://editor.swagger.io/ u
 
 ## Contributing:
 
--   A `.node-version` file has been provided in the repository root, use your preferred Node.js manager which [supports](https://github.com/shadowspawn/node-version-usage#supporting-products) the standard to manage the development Node.js environment
--   The monorepo supports [corepack](https://nodejs.org/api/corepack.html), follow the linked instructions to locally install the development package manager (i.e. [pnpm](https://pnpm.io/))
+-   Use the development Node.js version in the root `.node-version` file with your preferred Node.js manager which [supports](https://github.com/shadowspawn/node-version-usage#supporting-products) the standard.
+-   Install [Corepack](https://github.com/nodejs/corepack#installation) 0.36.0 or newer. The root `package.json` pins the [pnpm](https://pnpm.io/) version used by development and CI.
+
+Run installation and checks from the repository root:
 
 ```bash
-> pnpm install
-> pnpm test
+corepack enable
+corepack install
+pnpm install --frozen-lockfile
+pnpm build
+pnpm -r --if-present run lint
+pnpm -r --if-present run lint:ts
+pnpm test
+pnpm --filter openapi-zod-client-playground run build
 ```
 
-Assuming no issue were raised by the tests, you may use `pnpm dev` to watch for code changes during development.
+These checks finish after one run. Use `pnpm dev` to watch for code changes during development, or `pnpm --filter openapi-zod-client test` to run tests in watch mode.
 
 If you fix an edge case please make a dedicated minimal reproduction test in the [`tests`](./tests) folder so that it doesn't break in future versions
 

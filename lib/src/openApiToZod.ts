@@ -1,12 +1,12 @@
-import { isSchemaObject, type ReferenceObject, type SchemaObject } from "openapi3-ts";
+import { type ReferenceObject, type SchemaObject, isSchemaObject } from "openapi3-ts";
 import { match } from "ts-pattern";
 
 import type { CodeMetaData, ConversionTypeContext } from "./CodeMeta";
 import { CodeMeta } from "./CodeMeta";
+import { inferRequiredSchema } from "./inferRequiredOnly";
 import { isReferenceObject } from "./isReferenceObject";
 import type { TemplateContext } from "./template-context";
 import { escapeControlCharacters, isPrimitiveType, wrapWithQuotesIfNeeded } from "./utils";
-import { inferRequiredSchema } from "./inferRequiredOnly";
 
 type ConversionArgs = {
     schema: SchemaObject | ReferenceObject;
@@ -89,7 +89,7 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
 
         /* when there are multiple allOf we are unable to use a discriminatedUnion as this library adds an
          *   'z.and' to the schema that it creates which breaks type inference */
-        const hasMultipleAllOf = schema.oneOf?.some((obj) => isSchemaObject(obj) && (obj?.allOf || []).length > 1);
+        const hasMultipleAllOf = schema.oneOf?.some((obj) => isSchemaObject(obj) && (obj?.allOf ?? []).length > 1);
         if (schema.discriminator && !hasMultipleAllOf) {
             const propertyName = schema.discriminator.propertyName;
 
@@ -124,15 +124,16 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
             const type = getZodSchema({ schema: schema.allOf[0]!, ctx, meta, options });
             return code.assign(type.toString());
         }
+
         const { patchRequiredSchemaInLoop, noRequiredOnlyAllof, composedRequiredSchema } = inferRequiredSchema(schema);
 
         const types = noRequiredOnlyAllof.map((prop) => {
             const zodSchema = getZodSchema({ schema: prop, ctx, meta, options });
-            ctx?.resolver && patchRequiredSchemaInLoop(prop, ctx.resolver);
+            if (ctx?.resolver) patchRequiredSchemaInLoop(prop, ctx.resolver);
             return zodSchema;
         });
 
-        if (composedRequiredSchema.required.length) {
+        if (composedRequiredSchema.required.length > 0) {
             types.push(
                 getZodSchema({
                     schema: composedRequiredSchema,
@@ -142,6 +143,7 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
                 })
             );
         }
+
         const first = types.at(0)!;
         const rest = types
             .slice(1)
@@ -189,15 +191,11 @@ export function getZodSchema({ schema: $schema, ctx, meta: inheritedMeta, option
     if (schemaType === "array") {
         if (schema.items) {
             return code.assign(
-                `z.array(${
-                    getZodSchema({ schema: schema.items, ctx, meta, options }).toString()
-                }${
-                    getZodChain({
-                        schema: schema.items as SchemaObject,
-                        meta: { ...meta, isRequired: true },
-                        options,
-                    })
-                })${readonly}`
+                `z.array(${getZodSchema({ schema: schema.items, ctx, meta, options }).toString()}${getZodChain({
+                    schema: schema.items as SchemaObject,
+                    meta: { ...meta, isRequired: true },
+                    options,
+                })})${readonly}`
             );
         }
 

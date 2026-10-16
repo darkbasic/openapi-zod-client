@@ -7,8 +7,8 @@ import type { OpenAPIObject } from "openapi3-ts";
 import { safeJSONParse } from "pastable/server";
 import { resolveConfig } from "prettier";
 
-import { toBoolean } from "./utils";
 import { generateZodClientFromOpenAPI } from "./generateZodClientFromOpenAPI";
+import { toBoolean } from "./utils";
 
 const cli = cac("openapi-zod-client");
 const packageJson = safeJSONParse(readFileSync(resolve(__dirname, "../../package.json"), "utf8"));
@@ -71,7 +71,7 @@ cli.command("<input>", "path/url to OpenAPI/Swagger document as json/yaml")
         const prettierConfig = await resolveConfig(options.prettier || "./");
         const distPath = options.output || input + ".client.ts";
         const withAlias = toBoolean(options.withAlias, true);
-        const additionalPropertiesDefaultValue = toBoolean(options.additionalPropsDefaultValue, true);
+        const withAdditionalPropertiesByDefault = toBoolean(options.additionalPropsDefaultValue, true);
 
         await generateZodClientFromOpenAPI({
             openApiDoc,
@@ -96,7 +96,7 @@ cli.command("<input>", "path/url to OpenAPI/Swagger document as json/yaml")
                 withDescription: options.withDescription,
                 allReadonly: options.allReadonly,
                 strictObjects: options.strictObjects,
-                additionalPropertiesDefaultValue,
+                additionalPropertiesDefaultValue: withAdditionalPropertiesByDefault,
             },
         });
         console.log(`Done generating <${distPath}> !`);

@@ -117,11 +117,7 @@ export function getSchemaComplexity({
     }
 
     if (schema.type === "array") {
-        if (schema.items) {
-            return complexityByComposite("array") + getSchemaComplexity({ current, schema: schema.items });
-        }
-
-        return complexityByComposite("array") + getSchemaComplexity({ current, schema: undefined });
+        return complexityByComposite("array") + getSchemaComplexity({ current, schema: schema.items });
     }
 
     if (schema.type === "object" || schema.properties || schema.additionalProperties) {

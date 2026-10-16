@@ -2,12 +2,12 @@ import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t, ts } from "tanu";
 import type { TypeDefinition, TypeDefinitionObject } from "tanu/dist/type";
 
+import generateJSDocArray from "./generateJSDocArray";
+import { inferRequiredSchema } from "./inferRequiredOnly";
 import { isReferenceObject } from "./isReferenceObject";
 import type { DocumentResolver } from "./makeSchemaResolver";
 import type { TemplateContext } from "./template-context";
 import { wrapWithQuotesIfNeeded } from "./utils";
-import { inferRequiredSchema } from "./inferRequiredOnly";
-import generateJSDocArray from "./generateJSDocArray";
 
 type TsConversionArgs = {
     schema: SchemaObject | ReferenceObject;
@@ -160,7 +160,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
             const types = noRequiredOnlyAllof.map((prop) => {
                 const type = getTypescriptFromOpenApi({ schema: prop, ctx, meta, options }) as TypeDefinition;
-                ctx?.resolver && patchRequiredSchemaInLoop(prop, ctx.resolver);
+                if (ctx?.resolver) patchRequiredSchemaInLoop(prop, ctx.resolver);
                 return type;
             });
 
@@ -330,7 +330,7 @@ type SingleType = Exclude<SchemaObject["type"], any[] | undefined>;
 const isPrimitiveType = (type: SingleType): type is PrimitiveType => primitiveTypeList.includes(type as any);
 
 const primitiveTypeList = ["string", "number", "integer", "boolean", "null"] as const;
-type PrimitiveType = (typeof primitiveTypeList)[number];
+type PrimitiveType = typeof primitiveTypeList[number];
 
 const wrapTypeIfInline = ({
     isInline,

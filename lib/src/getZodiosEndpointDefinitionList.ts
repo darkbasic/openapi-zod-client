@@ -157,10 +157,10 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
             if (!operation) continue;
             if (options?.withDeprecatedEndpoints ? false : operation.deprecated) continue;
 
-            const parameters = Object.entries({
+            const parameters = Object.values({
                 ...parametersMap,
                 ...getParametersMap(operation.parameters ?? []),
-            }).map(([_id, param]) => param);
+            });
             const operationName = getOperationAlias(path, method, operation);
             let endpointDefinition: EndpointDefinitionWithRefs = {
                 method: method as EndpointDefinitionWithRefs["method"],

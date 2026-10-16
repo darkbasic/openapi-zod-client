@@ -2,3 +2,11 @@ packages:
   - "lib"
   - "playground"
   - "examples/*"
+
+allowBuilds:
+  "@swc/core": true
+  bufferutil: true
+  esbuild: true
+  utf-8-validate: true
+  "@emotion/memoize": false
+  es5-ext: false

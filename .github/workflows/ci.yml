@@ -8,16 +8,36 @@ on:
     branches: [main]
     paths:
       - lib/**
-      - lib/pnpm-lock.yaml
-      - lib/package.json
-      - lib/tsconfig.json
+      - playground/**
+      - examples/**
+      - samples/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .npmrc
+      - .node-version
+      - .eslintignore
+      - .prettierrc.json
+      - babel.config.json
+      - tsconfig.json
+      - .github/workflows/**
   pull_request:
     branches: [main]
     paths:
       - lib/**
-      - lib/pnpm-lock.yaml
-      - lib/package.json
-      - lib/tsconfig.json
+      - playground/**
+      - examples/**
+      - samples/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .npmrc
+      - .node-version
+      - .eslintignore
+      - .prettierrc.json
+      - babel.config.json
+      - tsconfig.json
+      - .github/workflows/**
 
 jobs:
   build:
@@ -25,16 +45,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [16.x, 18.x, 20.x]
+        node-version: [18.x, 20.x, 22.x, 24.x]
         # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
       - name: Install pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 8
+        uses: pnpm/action-setup@v6
       - name: Use Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v3
         with:
@@ -44,9 +62,14 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build
         run: pnpm build
+      - name: Lint
+        run: pnpm -r --if-present run lint
+      - name: Type check
+        run: pnpm -r --if-present run lint:ts
       - name: Test
-        working-directory: ./lib
         run: pnpm test
+      - name: Build playground
+        run: pnpm --filter openapi-zod-client-playground run build
   analyze:
     name: Analyze
     runs-on: ubuntu-latest

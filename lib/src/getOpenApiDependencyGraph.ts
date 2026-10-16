@@ -26,25 +26,10 @@ export const getOpenApiDependencyGraph = (
             return;
         }
 
-        if (schema.allOf) {
-            for (const allOf of schema.allOf) {
-                visit(allOf, fromRef);
-            }
-
-            return;
-        }
-
-        if (schema.oneOf) {
-            for (const oneOf of schema.oneOf) {
-                visit(oneOf, fromRef);
-            }
-
-            return;
-        }
-
-        if (schema.anyOf) {
-            for (const anyOf of schema.anyOf) {
-                visit(anyOf, fromRef);
+        const composite = schema.allOf ?? schema.oneOf ?? schema.anyOf;
+        if (composite) {
+            for (const branch of composite) {
+                visit(branch, fromRef);
             }
 
             return;
