@@ -392,3 +392,25 @@ test("union type array dependencies", () => {
       }
     `);
 });
+
+test.each([true, false])("array/object union tracks both branches (with items: %s)", (withItems) => {
+    const schemas: Record<string, SchemaObject> = {
+        Union: {
+            type: ["array", "object"],
+            ...(withItems ? { items: { $ref: "Item" } } : {}),
+            properties: { child: { $ref: "Property" } },
+            additionalProperties: { $ref: "AdditionalProperty" },
+        },
+        Item: { type: "string" },
+        Property: { type: "string" },
+        AdditionalProperty: { type: "number" },
+    };
+    const { refsDependencyGraph, deepDependencyGraph } = getOpenApiDependencyGraph(
+        Object.keys(schemas),
+        (ref) => schemas[ref]!
+    );
+    const dependencies = new Set([...(withItems ? ["Item"] : []), "Property", "AdditionalProperty"]);
+
+    expect(refsDependencyGraph["Union"]).toEqual(dependencies);
+    expect(deepDependencyGraph["Union"]).toEqual(dependencies);
+});

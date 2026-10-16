@@ -64,7 +64,10 @@ cli.command("<input>", "path/url to OpenAPI/Swagger document as json/yaml")
     )
     .action(async (input, options) => {
         console.log("Retrieving OpenAPI document from", input);
-        const openApiDoc = (await SwaggerParser.bundle(input)) as OpenAPIObject;
+        const openApiDoc = (await SwaggerParser.bundle(input, {
+            // Preserve CLI support for local/internal URLs and their external references.
+            resolve: { http: { safeUrlResolver: false } },
+        })) as OpenAPIObject;
         const prettierConfig = await resolveConfig(options.prettier || "./");
         const distPath = options.output || input + ".client.ts";
         const withAlias = toBoolean(options.withAlias, true);
