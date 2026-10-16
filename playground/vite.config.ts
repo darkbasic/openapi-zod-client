@@ -31,13 +31,13 @@ export default defineConfig((env) => {
         },
     };
 
-    if (env.command === "build" && env.ssrBuild) {
+    if (env.command === "build" && env.isSsrBuild) {
         if (Array.isArray(config.ssr!.noExternal)) {
             config.ssr!.noExternal.push("@saas-ui/react", "@chakra-ui/react", "@chakra-ui/styled-system");
         }
     }
 
-    if (process.env.VIZ && env.command === "build" && !env.ssrBuild) {
+    if (process.env.VIZ && env.command === "build" && !env.isSsrBuild) {
         config.plugins!.push(visualizer({ open: true }) as any);
     }
 

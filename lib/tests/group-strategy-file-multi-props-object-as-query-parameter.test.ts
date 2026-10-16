@@ -44,9 +44,11 @@ describe("file group strategy with multi-props object as query parameter", async
             options: { groupStrategy }
         });
 
-        const expectedIndex = `    "__index": "export { ${groupStrategy === "method-file" ? "PostApi" : "DefaultApi"} } from "./${groupStrategy === "method-file" ? "post" : "Default"}";\n",`;
+        const fileName = groupStrategy === "method-file" ? "post" : "Default";
+        const apiName = groupStrategy === "method-file" ? "PostApi" : "DefaultApi";
+        const expectedIndex = `export { ${apiName} } from "./${fileName}";\n`;
 
-        const expectedApi = `    "${groupStrategy === "method-file" ? "post" : "Default"}": "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
+        const expectedApi = `import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
 import { z } from "zod";
 
 const req = z
@@ -73,17 +75,16 @@ const endpoints = makeApi([
   },
 ]);
 
-export const ${groupStrategy === "method-file" ? "PostApi" : "DefaultApi"} = new Zodios(endpoints);
+export const ${apiName} = new Zodios(endpoints);
 
 export function createApiClient(baseUrl: string, options?: ZodiosOptions) {
   return new Zodios(baseUrl, endpoints, options);
-}\n",`;
+}\n`;
 
-        const expected = groupStrategy === "method-file"
-          ? `{\n${expectedIndex}\n${expectedApi}\n}`
-          : `{\n${expectedApi}\n${expectedIndex}\n}`;
-
-        expect(output).toMatchInlineSnapshot(expected);
+        expect(output).toEqual({
+            [fileName]: expectedApi,
+            __index: expectedIndex,
+        });
     };
 
     test("tag file", () => runTest("tag-file"));

@@ -17,7 +17,11 @@ export const presets = {
     } as const,
     getTemplates: async () => {
         // eslint-disable-next-line @typescript-eslint/await-thenable
-        const record = await import.meta.glob("../../../lib/src/templates/*.hbs", { as: "raw", eager: true });
+        const record = await import.meta.glob<string>("../../../lib/src/templates/*.hbs", {
+            query: "?raw",
+            import: "default",
+            eager: true,
+        });
         return Object.fromEntries(
             Object.entries(record).map(([key, value]) => [key.replace(/.*\/(.*)\.hbs/, "template-$1"), value])
         );

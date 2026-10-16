@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { safeJSONParse } from "pastable";
 import { rollup } from "rollup";
-import dts from "rollup-plugin-dts";
+import { dts } from "rollup-plugin-dts";
 import type { PackageJson } from "type-fest";
 
 const getDeps = (pkg: PackageJson) =>
@@ -12,11 +12,10 @@ const getDeps = (pkg: PackageJson) =>
 const getPkg = async (name: string) =>
     safeJSONParse<PackageJson>(await fs.promises.readFile(`./node_modules/${name}/package.json`, "utf8"));
 
-const getTypesDeclaration = async (name: string) => {
+const getTypesDeclaration = async (name: string, typesEntry?: string) => {
     const pkg = await getPkg(name);
-    if (!pkg.types && !pkg.typings) return;
-
-    const types = (pkg.types ?? pkg.typings)!;
+    const types = typesEntry ?? pkg.types ?? pkg.typings;
+    if (!types) return;
 
     const bundle = await rollup({
         input: path.resolve("./node_modules/", name, types),
@@ -29,7 +28,11 @@ const getTypesDeclaration = async (name: string) => {
 };
 
 const getTsDeclarations = async () => {
-    const declarations = await Promise.all([getTypesDeclaration("@zodios/core"), getTypesDeclaration("zod")]);
+    const declarations = await Promise.all([
+        getTypesDeclaration("@zodios/core"),
+        // The root Zod 3.25 entry adds a circular namespace wrapper that rollup-plugin-dts cannot bundle.
+        getTypesDeclaration("zod", "v3/index.d.cts"),
+    ]);
 
     return {
         data: [

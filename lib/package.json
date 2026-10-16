@@ -24,9 +24,9 @@
         "@apidevtools/swagger-parser": "^12.1.0",
         "@liuli-util/fs-extra": "^0.1.0",
         "@zodios/core": "^10.3.1",
-        "axios": "^1.6.0",
+        "axios": "^1.20.0",
         "cac": "^6.7.14",
-        "handlebars": "^4.7.7",
+        "handlebars": "^4.7.10",
         "openapi-types": "^12.0.2",
         "openapi3-ts": "3.1.0",
         "pastable": "^2.2.1",
@@ -34,24 +34,25 @@
         "tanu": "^0.1.13",
         "ts-pattern": "^5.0.1",
         "whence": "^2.0.0",
-        "zod": "^3.19.1"
+        "zod": "^3.22.3"
     },
     "devDependencies": {
         "@astahmer/eslint-config-ts": "^0.1.5",
         "@types/degit": "^2.8.3",
         "@types/fs-extra": "^9.0.13",
         "@types/js-yaml": "^4.0.5",
-        "@types/node": "^18.11.4",
+        "@types/node": "^20.19.0",
         "@types/prettier": "^2.7.1",
         "@typescript-eslint/eslint-plugin": "^5.40.1",
         "@typescript-eslint/parser": "^5.40.1",
-        "degit": "^2.8.4",
+        "degit": "^2.8.6",
         "eslint": "^8.26.0",
         "eslint-formatter-pretty": "^4.1.0",
         "fast-glob": "^3.2.12",
         "type-fest": "^2.19.0",
         "typescript": "^5.1.6",
-        "vitest": "^0.22.1"
+        "vitest": "^4.1.11",
+        "vite": "^6.4.4"
     },
     "preconstruct": {
         "entrypoints": [

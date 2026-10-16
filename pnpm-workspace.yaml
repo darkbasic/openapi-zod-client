@@ -10,3 +10,7 @@ allowBuilds:
   utf-8-validate: true
   "@emotion/memoize": false
   es5-ext: false
+
+# compile-time uses the stable build API through bundle-require (esbuild >=0.18).
+overrides:
+  "vite-plugin-compile-time>esbuild": "^0.25.12"

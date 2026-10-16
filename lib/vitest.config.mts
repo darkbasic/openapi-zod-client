@@ -1,5 +1,3 @@
-/// <reference types="vitest" />
-
 import { defineConfig } from "vitest/config";
 
 // https://vitejs.dev/config/

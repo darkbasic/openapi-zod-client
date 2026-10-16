@@ -302,7 +302,7 @@ You can do so by using the official Swagger Editor: https://editor.swagger.io/ u
 
 ## Contributing:
 
--   Use the development Node.js version in the root `.node-version` file with your preferred Node.js manager which [supports](https://github.com/shadowspawn/node-version-usage#supporting-products) the standard.
+-   Development tooling requires Node.js 22.13+ on the 22.x line, 24.x, or 26+. Use the version in the root `.node-version` file with your preferred Node.js manager which [supports](https://github.com/shadowspawn/node-version-usage#supporting-products) the standard.
 -   Install [Corepack](https://github.com/nodejs/corepack#installation) 0.36.0 or newer. The root `package.json` pins the [pnpm](https://pnpm.io/) version used by development and CI.
 
 Run installation and checks from the repository root:
@@ -319,6 +319,8 @@ pnpm --filter openapi-zod-client-playground run build
 ```
 
 These checks finish after one run. Use `pnpm dev` to watch for code changes during development, or `pnpm --filter openapi-zod-client test` to run tests in watch mode.
+
+Run `pnpm audit` to check all dependencies against npm advisories, or `pnpm audit --prod` for production dependencies. As of 2026-10-16, the remaining development-only finding is [GHSA-vfj7-8cjw-p6xm](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm) in `braces`, which has no patched release. Build tooling still depends on it; repository glob patterns are fixed, and the published generator does not depend on it. The finding is not suppressed, so the full audit continues to exit with a failure until an upstream fix or replacement is available.
 
 If you fix an edge case please make a dedicated minimal reproduction test in the [`tests`](./tests) folder so that it doesn't break in future versions
 

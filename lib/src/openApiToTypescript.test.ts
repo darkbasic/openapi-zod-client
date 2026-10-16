@@ -316,13 +316,11 @@ test("getSchemaAsTsString", () => {
             },
             { name: "Category" }
         )
-    ).toMatchInlineSnapshot(`
-      "export type Category = {
+    ).toBe(`export type Category = {
     propNumber: number | null;
     propString: string | null;
     propBoolean: boolean | null;
-      };"
-    `);
+};`);
 });
 
 describe("getSchemaAsTsString with context", () => {
@@ -905,11 +903,9 @@ test("getSchemaAsTsString with readonly", () => {
             { name: "Category" },
             options
         )
-    ).toMatchInlineSnapshot(`
-      "export type Category = Readonly<{
+    ).toBe(`export type Category = Readonly<{
     propNumber: number | null;
     propString: string | null;
     propBoolean: boolean | null;
-      }>;"
-    `);
+}>;`);
 });
