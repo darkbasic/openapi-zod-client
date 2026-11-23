@@ -124,26 +124,26 @@ describe("export-all-types", () => {
                 },
             ],
             types: {
-                Author: `type Author = Partial<{
-    name: (string | null) | number | null;
-    title: Title;
-    id: Id;
-    mail: string;
-    settings: Settings;
-}>;`,
-                Playlist: `type Playlist = Partial<{
-    name: string;
-    author: Author;
-    songs: Array<Song>;
-}> & Settings;`,
-                Settings: `type Settings = Partial<{
-    theme_color: string;
-    features: Features;
-}>;`,
-                Song: `type Song = Partial<{
-    name: string;
-    duration: number;
-}>;`,
+                Author: `type Author = {
+    name?: ((string | null) | number | null) | undefined;
+    title?: Title | undefined;
+    id?: Id | undefined;
+    mail?: string | undefined;
+    settings?: Settings | undefined;
+};`,
+                Playlist: `type Playlist = {
+    name?: string | undefined;
+    author?: Author | undefined;
+    songs?: Array<Song> | undefined;
+} & Settings;`,
+                Settings: `type Settings = {
+    theme_color?: string | undefined;
+    features?: Features | undefined;
+};`,
+                Song: `type Song = {
+    name?: string | undefined;
+    duration?: number | undefined;
+};`,
                 Features: "type Features = Array<string>;",
                 Id: "type Id = number;",
                 Title: "type Title = string;",
@@ -173,30 +173,29 @@ describe("export-all-types", () => {
           "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
           import { z } from "zod";
 
-          type Playlist = Partial<{
-            name: string;
-            author: Author;
-            songs: Array<Song>;
-          }> &
-            Settings;
-          type Author = Partial<{
-            name: (string | null) | number | null;
-            title: Title;
-            id: Id;
-            mail: string;
-            settings: Settings;
-          }>;
+          type Playlist = {
+            name?: string | undefined;
+            author?: Author | undefined;
+            songs?: Array<Song> | undefined;
+          } & Settings;
+          type Author = {
+            name?: ((string | null) | number | null) | undefined;
+            title?: Title | undefined;
+            id?: Id | undefined;
+            mail?: string | undefined;
+            settings?: Settings | undefined;
+          };
           type Title = string;
           type Id = number;
-          type Settings = Partial<{
-            theme_color: string;
-            features: Features;
-          }>;
+          type Settings = {
+            theme_color?: string | undefined;
+            features?: Features | undefined;
+          };
           type Features = Array<string>;
-          type Song = Partial<{
-            name: string;
-            duration: number;
-          }>;
+          type Song = {
+            name?: string | undefined;
+            duration?: number | undefined;
+          };
 
           const Title = z.string();
           const Id = z.number();

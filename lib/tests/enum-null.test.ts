@@ -111,9 +111,9 @@ test("enum-null", async () => {
       "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
       import { z } from "zod";
 
-      type Compound = Partial<{
-        field: Null1 | Null2 | Null3 | Null4 | string;
-      }>;
+      type Compound = {
+        field?: (Null1 | Null2 | Null3 | Null4 | string) | undefined;
+      };
       type Null1 = null;
       type Null2 = "a" | null;
       type Null3 = "a" | null;

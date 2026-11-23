@@ -49,9 +49,9 @@ test("getSchemaAsTsString", () => {
     );
     expect(getSchemaAsTsString({ type: "object", properties: { str: { type: "string" } } }, { name: "BasicObject" }))
         .toMatchInlineSnapshot(`
-          "export type BasicObject = Partial<{
-              str: string;
-          }>;"
+          "export type BasicObject = {
+              str?: string | undefined;
+          };"
         `);
     expect(
         getSchemaAsTsString(
@@ -59,10 +59,10 @@ test("getSchemaAsTsString", () => {
             { name: "BasicObject2" }
         )
     ).toMatchInlineSnapshot(`
-      "export type BasicObject2 = Partial<{
-          str: string;
-          nb: number;
-      }>;"
+      "export type BasicObject2 = {
+          str?: string | undefined;
+          nb?: number | undefined;
+      };"
     `);
 
     expect(
@@ -110,13 +110,13 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithNestedProp" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithNestedProp = Partial<{
-          str: string;
-          nb: number;
-          nested: Partial<{
-              nested_prop: boolean;
-          }>;
-      }>;"
+      "export type ObjectWithNestedProp = {
+          str?: string | undefined;
+          nb?: number | undefined;
+          nested?: {
+              nested_prop?: boolean | undefined;
+          } | undefined;
+      };"
     `);
 
     expect(
@@ -125,11 +125,11 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithAdditionalPropsNb" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithAdditionalPropsNb = Partial<{
-          str: string;
+      "export type ObjectWithAdditionalPropsNb = {
+          str?: string | undefined;
       } & {
           [key: string]: number;
-      }>;"
+      };"
     `);
 
     expect(
@@ -142,13 +142,13 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithNestedRecordBoolean" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithNestedRecordBoolean = Partial<{
-          str: string;
+      "export type ObjectWithNestedRecordBoolean = {
+          str?: string | undefined;
       } & {
-          [key: string]: Partial<{
-              prop: boolean;
-          }>;
-      }>;"
+          [key: string]: {
+              prop?: boolean | undefined;
+          };
+      };"
     `);
 
     expect(
@@ -162,9 +162,9 @@ test("getSchemaAsTsString", () => {
             },
         })
     ).toMatchInlineSnapshot(`
-      "Array<Partial<{
-          str: string;
-      }>>"
+      "Array<{
+          str?: string | undefined;
+      }>"
     `);
 
     expect(
@@ -190,9 +190,9 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithEnum" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithEnum = Partial<{
-          enumprop: "aaa" | "bbb" | "ccc";
-      }>;"
+      "export type ObjectWithEnum = {
+          enumprop?: ("aaa" | "bbb" | "ccc") | undefined;
+      };"
     `);
 
     expect(getSchemaAsTsString({ type: "string", enum: ["aaa", "bbb", "ccc"] })).toMatchInlineSnapshot(
@@ -213,9 +213,9 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithUnion" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithUnion = Partial<{
-          union: string | number;
-      }>;"
+      "export type ObjectWithUnion = {
+          union?: (string | number) | undefined;
+      };"
     `);
     expect(getSchemaAsTsString({ oneOf: [{ type: "string" }, { type: "number" }] })).toMatchInlineSnapshot(
         '"string | number"'
@@ -268,9 +268,9 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithUnion" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithUnion = Partial<{
-          union: string | number;
-      }>;"
+      "export type ObjectWithUnion = {
+          union?: (string | number) | undefined;
+      };"
     `);
 
     expect(
@@ -284,9 +284,9 @@ test("getSchemaAsTsString", () => {
             { name: "ObjectWithIntersection" }
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithIntersection = Partial<{
-          intersection: string & number;
-      }>;"
+      "export type ObjectWithIntersection = {
+          intersection?: (string & number) | undefined;
+      };"
     `);
 
     expect(getSchemaAsTsString({ type: "string", enum: ["aaa", "bbb", "ccc"] })).toMatchInlineSnapshot(
@@ -350,11 +350,11 @@ describe("getSchemaAsTsString with context", () => {
         Object.keys(schemas).forEach((key) => ctx.resolver.getSchemaByRef(asComponentSchema(key)));
         expect(printTs(getTypescriptFromOpenApi({ schema: schemas["Root"]!, meta: { name: "Root" }, ctx }) as ts.Node))
             .toMatchInlineSnapshot(`
-              "export type Root = Partial<{
-                  str: string;
-                  nb: number;
-                  nested: Nested;
-              }>;"
+              "export type Root = {
+                  str?: string | undefined;
+                  nb?: number | undefined;
+                  nested?: Nested | undefined;
+              };"
             `);
     });
 
@@ -394,11 +394,11 @@ describe("getSchemaAsTsString with context", () => {
         expect(
             printTs(getTypescriptFromOpenApi({ schema: schemas["Root2"]!, meta: { name: "Root2" }, ctx }) as ts.Node)
         ).toMatchInlineSnapshot(`
-          "export type Root2 = Partial<{
-              str: string;
-              nb: number;
-              nested: Nested2;
-          }>;"
+          "export type Root2 = {
+              str?: string | undefined;
+              nb?: number | undefined;
+              nested?: Nested2 | undefined;
+          };"
         `);
     });
 
@@ -438,12 +438,12 @@ describe("getSchemaAsTsString with context", () => {
                 }) as ts.Node
             )
         ).toMatchInlineSnapshot(`
-          "export type Root3 = Partial<{
-              str: string;
-              nb: number;
-              nested: Nested3;
-              arrayOfNested: Array<Nested3>;
-          }>;"
+          "export type Root3 = {
+              str?: string | undefined;
+              nb?: number | undefined;
+              nested?: Nested3 | undefined;
+              arrayOfNested?: Array<Nested3> | undefined;
+          };"
         `);
     });
 
@@ -481,13 +481,13 @@ describe("getSchemaAsTsString with context", () => {
         }) as ts.Node;
 
         expect(printTs(result)).toMatchInlineSnapshot(`
-          "export type Root4 = Partial<{
-              str: string;
-              nb: number;
-              self: Root4;
-              nested: Nested4;
-              arrayOfSelf: Array<Root4>;
-          }>;"
+          "export type Root4 = {
+              str?: string | undefined;
+              nb?: number | undefined;
+              self?: Root4 | undefined;
+              nested?: Nested4 | undefined;
+              arrayOfSelf?: Array<Root4> | undefined;
+          };"
         `);
     });
 
@@ -530,10 +530,10 @@ describe("getSchemaAsTsString with context", () => {
         }) as ts.Node;
 
         expect(printTs(result)).toMatchInlineSnapshot(`
-          "export type Root = Partial<{
-              recursive: User;
-              basic: number;
-          }>;"
+          "export type Root = {
+              recursive?: User | undefined;
+              basic?: number | undefined;
+          };"
         `);
     });
 
@@ -579,11 +579,11 @@ describe("getSchemaAsTsString with context", () => {
         }) as ts.Node;
 
         expect(printTs(result)).toMatchInlineSnapshot(`
-          "export type Root = Partial<{
-              user: User | Member;
-              users: Array<User | Member>;
-              basic: number;
-          }>;"
+          "export type Root = {
+              user?: (User | Member) | undefined;
+              users?: Array<User | Member> | undefined;
+              basic?: number | undefined;
+          };"
         `);
     });
 });
@@ -624,9 +624,9 @@ test("getSchemaAsTsString with readonly", () => {
     );
     expect(getSchemaAsTsString({ type: "object", properties: { str: { type: "string" } } }, { name: "BasicObject" }, options))
         .toMatchInlineSnapshot(`
-          "export type BasicObject = Partial<Readonly<{
-              str: string;
-          }>>;"
+          "export type BasicObject = Readonly<{
+              str?: string | undefined;
+          }>;"
         `);
     expect(
         getSchemaAsTsString(
@@ -635,10 +635,10 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type BasicObject2 = Partial<Readonly<{
-          str: string;
-          nb: number;
-      }>>;"
+      "export type BasicObject2 = Readonly<{
+          str?: string | undefined;
+          nb?: number | undefined;
+      }>;"
     `);
 
     expect(
@@ -689,13 +689,13 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithNestedProp = Partial<Readonly<{
-          str: string;
-          nb: number;
-          nested: Partial<Readonly<{
-              nested_prop: boolean;
-          }>>;
-      }>>;"
+      "export type ObjectWithNestedProp = Readonly<{
+          str?: string | undefined;
+          nb?: number | undefined;
+          nested?: Readonly<{
+              nested_prop?: boolean | undefined;
+          }> | undefined;
+      }>;"
     `);
 
     expect(
@@ -705,11 +705,11 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithAdditionalPropsNb = Partial<Readonly<{
-          str: string;
+      "export type ObjectWithAdditionalPropsNb = Readonly<{
+          str?: string | undefined;
       } & {
           [key: string]: number;
-      }>>;"
+      }>;"
     `);
 
     expect(
@@ -723,13 +723,13 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithNestedRecordBoolean = Partial<Readonly<{
-          str: string;
+      "export type ObjectWithNestedRecordBoolean = Readonly<{
+          str?: string | undefined;
       } & {
-          [key: string]: Partial<Readonly<{
-              prop: boolean;
-          }>>;
-      }>>;"
+          [key: string]: Readonly<{
+              prop?: boolean | undefined;
+          }>;
+      }>;"
     `);
 
     expect(
@@ -743,9 +743,9 @@ test("getSchemaAsTsString with readonly", () => {
             },
         }, undefined, options)
     ).toMatchInlineSnapshot(`
-      "Readonly<Array<Partial<Readonly<{
-          str: string;
-      }>>>>"
+      "Readonly<Array<Readonly<{
+          str?: string | undefined;
+      }>>>"
     `);
 
     expect(
@@ -772,9 +772,9 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithEnum = Partial<Readonly<{
-          enumprop: "aaa" | "bbb" | "ccc";
-      }>>;"
+      "export type ObjectWithEnum = Readonly<{
+          enumprop?: ("aaa" | "bbb" | "ccc") | undefined;
+      }>;"
     `);
 
     expect(getSchemaAsTsString({ type: "string", enum: ["aaa", "bbb", "ccc"] }, undefined, options)).toMatchInlineSnapshot(
@@ -796,9 +796,9 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithUnion = Partial<Readonly<{
-          union: string | number;
-      }>>;"
+      "export type ObjectWithUnion = Readonly<{
+          union?: (string | number) | undefined;
+      }>;"
     `);
     expect(getSchemaAsTsString({ oneOf: [{ type: "string" }, { type: "number" }] }, undefined, options)).toMatchInlineSnapshot(
         '"string | number"'
@@ -853,9 +853,9 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithUnion = Partial<Readonly<{
-          union: string | number;
-      }>>;"
+      "export type ObjectWithUnion = Readonly<{
+          union?: (string | number) | undefined;
+      }>;"
     `);
 
     expect(
@@ -870,9 +870,9 @@ test("getSchemaAsTsString with readonly", () => {
             options
         )
     ).toMatchInlineSnapshot(`
-      "export type ObjectWithIntersection = Partial<Readonly<{
-          intersection: string & number;
-      }>>;"
+      "export type ObjectWithIntersection = Readonly<{
+          intersection?: (string & number) | undefined;
+      }>;"
     `);
 
     expect(getSchemaAsTsString({ type: "string", enum: ["aaa", "bbb", "ccc"] }, undefined, options)).toMatchInlineSnapshot(

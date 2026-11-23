@@ -224,12 +224,11 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
         if (schemaType === "object" || schema.properties || schema.additionalProperties) {
             if (!schema.properties) {
-                return {};
+                return ts.factory.createTypeLiteralNode([]);
             }
 
             canBeWrapped = false;
 
-            const isPartial = !schema.required?.length;
             let additionalProperties;
             if (schema.additionalProperties) {
                 let additionalPropertiesType;
@@ -275,30 +274,31 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                     }) as TypeDefinition;
                     if (typeof propType === "string") {
                         if (!ctx) throw new Error("Context is required for circular $ref (recursive schemas)");
-                        // TODO Partial ?
                         propType = t.reference(propType);
                     }
 
-                    const isRequired = Boolean(isPartial ? true : schema.required?.includes(prop));
-                    return [`${wrapWithQuotesIfNeeded(prop)}`, isRequired ? propType : t.optional(propType)];
+                    const isRequired = schema.required?.includes(prop);
+                    if (!isRequired) {
+                        const optional = t.optional(propType);
+                        if (options?.withDocs) {
+                            // Tanu transfers outer comments to the property. The union factory
+                            // may parenthesize a documented union or intersection inside it.
+                            const value = optional.types[0]!;
+                            ts.moveSyntheticComments(optional, ts.isParenthesizedTypeNode(value) ? value.type : value);
+                        }
+
+                        propType = optional;
+                    }
+
+                    return [wrapWithQuotesIfNeeded(prop), propType];
                 })
             );
 
             const objectType = additionalProperties ? t.intersection([props, additionalProperties]) : props;
 
-            if (isInline) {
-                return isPartial ? t.reference("Partial", [doWrapReadOnly(objectType)]) : doWrapReadOnly(objectType);
-            }
-
-            if (!inheritedMeta?.name) {
-                throw new Error("Name is required to convert an object schema to a type reference");
-            }
-
-            if (!isPartial) {
-                return t.type(inheritedMeta.name, doWrapReadOnly(objectType));
-            }
-
-            return t.type(inheritedMeta.name, t.reference("Partial", [doWrapReadOnly(objectType)]));
+            // Materialize inline objects as TypeNodes too, including index-signature values.
+            const declaration = t.type(inheritedMeta?.name ?? "", doWrapReadOnly(objectType));
+            return isInline ? declaration.type : declaration;
         }
 
         if (!schemaType) return t.unknown();

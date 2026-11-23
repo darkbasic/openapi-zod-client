@@ -9,6 +9,7 @@ function typeErrors(source: string): string[] {
     const filename = fileURLToPath(new URL("./.generated-anyOf-types.ts", import.meta.url));
     const options: ts.CompilerOptions = {
         strict: true,
+        exactOptionalPropertyTypes: true,
         noEmit: true,
         skipLibCheck: true,
         target: ts.ScriptTarget.ES2020,
@@ -44,6 +45,7 @@ test.each([false, true])("anyOf types match runtime unions (readonly: %s)", (all
                     type: "object",
                     required: ["status", "mixed", "parent", "choice", "children"],
                     properties: {
+                        settings: { type: "object", properties: { label: { type: "string" } } },
                         status: { $ref: "#/components/schemas/Status" },
                         mixed: { $ref: "#/components/schemas/Mixed" },
                         parent: { anyOf: [{ $ref: "#/components/schemas/Node" }, { type: "null" }] },
@@ -70,6 +72,7 @@ test.each([false, true])("anyOf types match runtime unions (readonly: %s)", (all
         const valid = { status: "ready", mixed: -1, parent: null, choice: null, children: [] };
 
         expect(schema.safeParse(valid).success).toBe(true);
+        expect(schema.safeParse({ ...valid, settings: { label: undefined } }).success).toBe(true);
         expect(schema.safeParse({ ...valid, parent: valid, choice: "ready", children: [valid] }).success).toBe(true);
         expect(schema.safeParse({ ...valid, choice: 1 }).success).toBe(true);
         expect(schema.safeParse({ ...valid, parent: [valid] }).success).toBe(false);
@@ -89,6 +92,10 @@ ${(allReadonly ? [] : Object.entries(context.schemas))
 const valid: Node = { status: "ready", mixed: -1, parent: null, choice: null, children: [] };
 const nested: Node = { ...valid, parent: valid, choice: "ready", children: [valid] };
 const numericChoice: Node = { ...valid, choice: 1 };
+const omitted: Node = { ...valid, settings: {} };
+const explicitUndefined: Node = { ...valid, settings: { label: undefined } };
+// @ts-expect-error the optional property accepts only strings and undefined
+const invalidSettings: Node = { ...valid, settings: { label: 3 } };
 const statuses: Status[] = ["ready", 'quoted "label"', null];
 const mixed: Mixed[] = ["ready", -1, 0, true, false, null];
 // @ts-expect-error anyOf does not introduce array alternatives

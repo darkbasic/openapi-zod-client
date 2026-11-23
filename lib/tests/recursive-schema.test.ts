@@ -128,13 +128,13 @@ describe("recursive-schema", () => {
           "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
           import { z } from "zod";
 
-          type User = Partial<{
-            name: string;
-            middle: Middle;
-          }>;
-          type Middle = Partial<{
-            user: User;
-          }>;
+          type User = {
+            name?: string | undefined;
+            middle?: Middle | undefined;
+          };
+          type Middle = {
+            user?: User | undefined;
+          };
 
           const Middle: z.ZodType<Middle> = z.lazy(() =>
             z.object({ user: User }).partial().passthrough()
@@ -449,25 +449,25 @@ describe("recursive-schema", () => {
                   "UserWithFriends": "z.lazy(() => z.object({ name: z.string(), parent: UserWithFriends, friends: z.array(Friend), bestFriend: Friend }).partial().passthrough())",
               },
               "types": {
-                  "Friend": "type Friend = Partial<{
-              nickname: string;
-              user: UserWithFriends;
-              circle: Array<Friend>;
-          }>;",
-                  "ObjectWithRecursiveArray": "type ObjectWithRecursiveArray = Partial<{
-              isInsideObjectWithRecursiveArray: boolean;
-              array: Array<ObjectWithRecursiveArray>;
-          }>;",
-                  "User": "type User = Partial<{
-              name: string;
-              parent: User;
-          }>;",
-                  "UserWithFriends": "type UserWithFriends = Partial<{
-              name: string;
-              parent: UserWithFriends;
-              friends: Array<Friend>;
-              bestFriend: Friend;
-          }>;",
+                  "Friend": "type Friend = {
+              nickname?: string | undefined;
+              user?: UserWithFriends | undefined;
+              circle?: Array<Friend> | undefined;
+          };",
+                  "ObjectWithRecursiveArray": "type ObjectWithRecursiveArray = {
+              isInsideObjectWithRecursiveArray?: boolean | undefined;
+              array?: Array<ObjectWithRecursiveArray> | undefined;
+          };",
+                  "User": "type User = {
+              name?: string | undefined;
+              parent?: User | undefined;
+          };",
+                  "UserWithFriends": "type UserWithFriends = {
+              name?: string | undefined;
+              parent?: UserWithFriends | undefined;
+              friends?: Array<Friend> | undefined;
+              bestFriend?: Friend | undefined;
+          };",
               },
           }
         `);
@@ -477,25 +477,25 @@ describe("recursive-schema", () => {
           "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
           import { z } from "zod";
 
-          type User = Partial<{
-            name: string;
-            parent: User;
-          }>;
-          type UserWithFriends = Partial<{
-            name: string;
-            parent: UserWithFriends;
-            friends: Array<Friend>;
-            bestFriend: Friend;
-          }>;
-          type Friend = Partial<{
-            nickname: string;
-            user: UserWithFriends;
-            circle: Array<Friend>;
-          }>;
-          type ObjectWithRecursiveArray = Partial<{
-            isInsideObjectWithRecursiveArray: boolean;
-            array: Array<ObjectWithRecursiveArray>;
-          }>;
+          type User = {
+            name?: string | undefined;
+            parent?: User | undefined;
+          };
+          type UserWithFriends = {
+            name?: string | undefined;
+            parent?: UserWithFriends | undefined;
+            friends?: Array<Friend> | undefined;
+            bestFriend?: Friend | undefined;
+          };
+          type Friend = {
+            nickname?: string | undefined;
+            user?: UserWithFriends | undefined;
+            circle?: Array<Friend> | undefined;
+          };
+          type ObjectWithRecursiveArray = {
+            isInsideObjectWithRecursiveArray?: boolean | undefined;
+            array?: Array<ObjectWithRecursiveArray> | undefined;
+          };
 
           const Friend: z.ZodType<Friend> = z.lazy(() =>
             z
@@ -620,24 +620,24 @@ describe("recursive-schema", () => {
           "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
           import { z } from "zod";
 
-          type Playlist = Partial<{
-            name: string;
-            author: Author;
-            songs: Array<Song>;
-          }>;
-          type Author = Partial<{
-            name: string;
-            mail: string;
-            settings: Settings;
-          }>;
-          type Settings = Partial<{
-            theme_color: string;
-          }>;
-          type Song = Partial<{
-            name: string;
-            duration: number;
-            in_playlists: Array<Playlist>;
-          }>;
+          type Playlist = {
+            name?: string | undefined;
+            author?: Author | undefined;
+            songs?: Array<Song> | undefined;
+          };
+          type Author = {
+            name?: string | undefined;
+            mail?: string | undefined;
+            settings?: Settings | undefined;
+          };
+          type Settings = {
+            theme_color?: string | undefined;
+          };
+          type Song = {
+            name?: string | undefined;
+            duration?: number | undefined;
+            in_playlists?: Array<Playlist> | undefined;
+          };
 
           const Settings = z.object({ theme_color: z.string() }).partial().passthrough();
           const Author = z

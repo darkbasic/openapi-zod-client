@@ -3876,10 +3876,10 @@ test("with optional, partial, all required objects", async () => {
           circularToRoot?: Root2 | undefined;
           requiredProp: string;
       };",
-              "PartialObject": "type PartialObject = Partial<{
-          something: string;
-          another: number;
-      }>;",
+              "PartialObject": "type PartialObject = {
+          something?: string | undefined;
+          another?: number | undefined;
+      };",
               "Root2": "type Root2 = {
           str: string;
           nb: number;
@@ -3906,10 +3906,10 @@ test("with optional, partial, all required objects", async () => {
       };
       type DeeplyNested = Array<VeryDeeplyNested>;
       type VeryDeeplyNested = "aaa" | "bbb" | "ccc";
-      type PartialObject = Partial<{
-        something: string;
-        another: number;
-      }>;
+      type PartialObject = {
+        something?: string | undefined;
+        another?: number | undefined;
+      };
       type Nested2 = {
         nested_prop?: boolean | undefined;
         deeplyNested?: DeeplyNested | undefined;

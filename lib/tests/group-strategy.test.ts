@@ -1389,26 +1389,26 @@ test("group-strategy with complex schemas + split files", async () => {
       ",
           "__common": "import { z } from "zod";
 
-      export type User = Partial<{
-        id: number;
-        firstname: string;
-        lastname: string;
-        email: string;
-        friends: Array<User>;
-      }>;
-      export type Store = Partial<{
-        id: number;
-        name: string;
-        address: string;
-        country: Country;
-        owner: User;
-      }>;
-      export type Country = Partial<{
-        id: number;
-        name: string;
-        code: string;
-        store_list: Array<Store>;
-      }>;
+      export type User = {
+        id?: number | undefined;
+        firstname?: string | undefined;
+        lastname?: string | undefined;
+        email?: string | undefined;
+        friends?: Array<User> | undefined;
+      };
+      export type Store = {
+        id?: number | undefined;
+        name?: string | undefined;
+        address?: string | undefined;
+        country?: Country | undefined;
+        owner?: User | undefined;
+      };
+      export type Country = {
+        id?: number | undefined;
+        name?: string | undefined;
+        code?: string | undefined;
+        store_list?: Array<Store> | undefined;
+      };
 
       export const User = z.lazy(() =>
         z
