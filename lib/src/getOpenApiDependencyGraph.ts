@@ -1,16 +1,20 @@
-import type { ReferenceObject, SchemaObject } from "openapi3-ts";
+import type { SchemaObject } from "openapi3-ts";
 
 import { isReferenceObject } from "./isReferenceObject";
+import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 
 export const getOpenApiDependencyGraph = (
     schemaRef: string[],
-    getSchemaByRef: (ref: string) => SchemaObject | ReferenceObject
+    getSchemaByRef: (ref: string) => SchemaInput,
+    supportsSchemaRefSiblings = false
 ) => {
+    const normalizedSchemas = new WeakMap<object, SchemaObject>();
     const visitedsRefs = {} as Record<string, boolean>;
     const refsDependencyGraph = {} as Record<string, Set<string>>;
 
-    const visit = (schema: SchemaObject | ReferenceObject, fromRef: string): void => {
-        if (!schema) return;
+    const visit = (input: SchemaInput, fromRef: string): void => {
+        if (!input || typeof input === "boolean") return;
+        const schema = normalizeBooleanSchema(input, normalizedSchemas);
 
         if (isReferenceObject(schema)) {
             if (!refsDependencyGraph[fromRef]) {
@@ -19,41 +23,24 @@ export const getOpenApiDependencyGraph = (
 
             refsDependencyGraph[fromRef]!.add(schema.$ref);
 
-            if (visitedsRefs[schema.$ref]) return;
-
-            visitedsRefs[fromRef] = true;
-            visit(getSchemaByRef(schema.$ref), schema.$ref);
-            return;
-        }
-
-        const composite = schema.allOf ?? schema.oneOf ?? schema.anyOf;
-        if (composite) {
-            for (const branch of composite) {
-                visit(branch, fromRef);
+            if (!visitedsRefs[schema.$ref]) {
+                visitedsRefs[fromRef] = true;
+                visit(getSchemaByRef(schema.$ref), schema.$ref);
             }
 
-            return;
+            if (!supportsSchemaRefSiblings) return;
         }
 
-        if (schema.type === "array" || (Array.isArray(schema.type) && schema.type.includes("array"))) {
-            if (schema.items) {
-                visit(schema.items, fromRef);
-            }
-
-            if (!Array.isArray(schema.type) || !schema.type.includes("object")) return;
+        // A schema object's $ref siblings are independent child schemas in 3.1.
+        const local: SchemaObject = { ...schema };
+        if (local.not) visit(local.not, fromRef);
+        for (const composite of [local.allOf, local.oneOf, local.anyOf]) {
+            for (const branch of composite ?? []) visit(branch, fromRef);
         }
 
-        if (schema.type === "object" || schema.properties || schema.additionalProperties) {
-            if (schema.properties) {
-                for (const property in schema.properties) {
-                    visit(schema.properties[property]!, fromRef);
-                }
-            }
-
-            if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
-                visit(schema.additionalProperties, fromRef);
-            }
-        }
+        if (local.items) visit(local.items, fromRef);
+        for (const child of Object.values(local.properties ?? {})) visit(child, fromRef);
+        if (typeof local.additionalProperties === "object") visit(local.additionalProperties, fromRef);
     };
 
     schemaRef.forEach((ref) => visit(getSchemaByRef(ref), ref));

@@ -1,13 +1,59 @@
 import type { SchemaObject } from "openapi3-ts";
+import { transpileModule } from "typescript";
 import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import { getZodSchema } from "../src/openApiToZod";
+import { getZodClientTemplateContext } from "../src/template-context";
+import { typeErrors } from "./typeErrors";
 
 function generatedSchema(schema: SchemaObject): z.ZodTypeAny {
-    return new Function("z", `return ${getZodSchema({ schema })}`)(z);
+    const source = transpileModule(`const schema = ${getZodSchema({ schema })};`, {}).outputText;
+    return new Function("z", source + "\nreturn schema;")(z);
 }
 
 describe("enum values", () => {
+    test("a null discriminator excluded by its enum leaves the other branch usable", () => {
+        const option = (kind: SchemaObject): SchemaObject => ({
+            type: "object",
+            required: ["kind"],
+            properties: { kind },
+        });
+        const schema = generatedSchema({
+            oneOf: [option({ type: "null", enum: ["retired"] }), option({ type: "string", enum: ["active"] })],
+            discriminator: { propertyName: "kind" },
+        });
+        expect(schema.parse({ kind: "active" })).toEqual({ kind: "active" });
+        expect(schema.safeParse({ kind: null }).success).toBe(false);
+    });
+    test("filters fractional integer enum members in both generated validators and types", () => {
+        const integers: SchemaObject = { type: "integer", enum: [1, 1.5, 2] };
+        const context = getZodClientTemplateContext(
+            {
+                openapi: "3.1.0",
+                info: { title: "Integers", version: "1" },
+                paths: {},
+                components: {
+                    schemas: {
+                        Count: integers,
+                        Counts: { type: "array", items: { $ref: "#/components/schemas/Count" } },
+                    },
+                },
+            },
+            { shouldExportAllSchemas: true, shouldExportAllTypes: true }
+        );
+        expect(
+            typeErrors(`${context.types.Count}
+const allowed: Count = 2;
+// @ts-expect-error integer enums exclude fractional literals
+const fractional: Count = 1.5;
+`)
+        ).toEqual([]);
+        const validator = generatedSchema({ ...integers, maximum: 1 });
+        expect(validator.parse(1)).toBe(1);
+        expect(validator.safeParse(1.5).success).toBe(false);
+        expect(validator.safeParse(2).success).toBe(false);
+        expect(generatedSchema({ type: "number", enum: [1.5] }).parse(1.5)).toBe(1.5);
+    });
     test.each<SchemaObject>([
         { type: "string", enum: ["ready", "waiting", null] },
         { type: "string", enum: ["ready", "waiting", null], nullable: true },

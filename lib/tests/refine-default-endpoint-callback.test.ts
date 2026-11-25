@@ -48,6 +48,7 @@ test("refine-default-endpoint-callback", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -124,6 +125,7 @@ test("refine-default-endpoint-callback", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {

@@ -32,7 +32,12 @@ test("allOf-missing-and", async () => {
       import { z } from "zod";
 
       const test2 = z
-        .object({ text2: z.string().min(5).max(10) })
+        .object({
+          text2: z
+            .string()
+            .regex(/^[\\s\\S]{5}/u)
+            .regex(/^[\\s\\S]{0,10}$/u),
+        })
         .partial()
         .passthrough();
 
@@ -46,7 +51,12 @@ test("allOf-missing-and", async () => {
           path: "/pet",
           requestFormat: "json",
           response: z
-            .object({ text2: z.string().min(5).max(10) })
+            .object({
+              text2: z
+                .string()
+                .regex(/^[\\s\\S]{5}/u)
+                .regex(/^[\\s\\S]{0,10}$/u),
+            })
             .partial()
             .passthrough(),
         },

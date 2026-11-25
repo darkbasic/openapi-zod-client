@@ -169,7 +169,18 @@ test("jsdoc", async () => {
         .object({
           example: z.string(),
           examples: z.string(),
-          manyTagsStr: z.enum(["a", "b", "c"]).regex(/^[a-z]*$/),
+          manyTagsStr: z.enum(["a", "b", "c"]).refine(
+            (
+              (check) => (value: unknown) =>
+                check.safeParse(value).success
+            )(
+              z
+                .string()
+                .min(1)
+                .regex(/^[\\s\\S]{0,10}$/u)
+                .regex(/^[a-z]*$/u)
+            )
+          ),
           numMin: z.number().gte(0),
           numMax: z.number().lte(10),
           manyTagsNum: z.number().gte(0).lte(10).default(5),

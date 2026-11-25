@@ -1410,7 +1410,7 @@ test("group-strategy with complex schemas + split files", async () => {
         store_list?: Array<Store> | undefined;
       };
 
-      export const User = z.lazy(() =>
+      export const User: z.ZodType<User> = z.lazy(() =>
         z
           .object({
             id: z.number().int(),
@@ -1422,7 +1422,7 @@ test("group-strategy with complex schemas + split files", async () => {
           .partial()
           .passthrough()
       );
-      export const Country = z.lazy(() =>
+      export const Country: z.ZodType<Country> = z.lazy(() =>
         z
           .object({
             id: z.number().int(),
@@ -1433,7 +1433,7 @@ test("group-strategy with complex schemas + split files", async () => {
           .partial()
           .passthrough()
       );
-      export const Store = z.lazy(() =>
+      export const Store: z.ZodType<Store> = z.lazy(() =>
         z
           .object({
             id: z.number().int(),

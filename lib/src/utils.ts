@@ -20,7 +20,7 @@ export const wrapWithQuotesIfNeeded = (str: string) => {
         return str;
     }
 
-    return `"${str}"`;
+    return JSON.stringify(str);
 };
 
 const prefixStringStartingWithNumberIfNeeded = (str: string) => {
@@ -67,20 +67,22 @@ export const isPrimitiveType = (type: SingleType): type is PrimitiveType => prim
 const primitiveTypeList = ["string", "number", "integer", "boolean", "null"] as const;
 export type PrimitiveType = typeof primitiveTypeList[number];
 
+export const primitiveEnumValues = (values: NonNullable<SchemaObject["enum"]>, type: PrimitiveType) =>
+    values.filter((value) =>
+        type === "integer" ? Number.isInteger(value) : type === "null" ? value === null : typeof value === type
+    );
+
 export const escapeControlCharacters = (str: string): string => {
-    return str
-        .replace(/\t/g, "\\t") // U+0009
-        .replace(/\n/g, "\\n") // U+000A
-        .replace(/\r/g, "\\r") // U+000D
-        .replace(/([\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\uFFFE\uFFFF])/g, (_m, p1) => {
-            const dec: number = p1.codePointAt();
-            const hex: string = dec.toString(16);
-            // eslint-disable-next-line sonarjs/no-nested-template-literals
-            if (dec <= 0xff) return `\\x${`00${hex}`.slice(-2)}`;
-            // eslint-disable-next-line sonarjs/no-nested-template-literals
-            return `\\u${`0000${hex}`.slice(-4)}`;
-        })
-        .replace(/\//g, "\\/");
+    // RegExp.source already quotes slashes and line terminators. Keep the remaining
+    // non-printable characters and lone surrogates representable in a UTF-8 source file.
+    return str.replace(/(\\*)([\s\S])/gu, (match, escapes: string, char: string) => {
+        if (!/[\u0000-\u001F\u007F-\u009F\uD800-\uDFFF\uFFFE\uFFFF]/u.test(char)) return match;
+        const code = char.codePointAt(0)!;
+        const hex = code.toString(16);
+        const escaped = char === "\t" ? "\\t" : code <= 0xff ? "\\x" + hex.padStart(2, "0") : "\\u" + hex;
+        // A legacy identity escape already consumes the last backslash.
+        return escapes.slice(0, escapes.length - (escapes.length % 2)) + escaped;
+    });
 };
 
 export const toBoolean = (value: undefined | string | boolean, defaultValue: boolean) =>

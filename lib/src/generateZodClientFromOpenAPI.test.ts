@@ -4229,7 +4229,7 @@ test('getZodClientTemplateContext with allReadonly', async () => {
                   "parameters": [],
                   "path": "/store/inventory",
                   "requestFormat": "json",
-                  "response": "z.record(z.number().int())",
+                  "response": "z.record(z.number().int()).readonly()",
               },
               {
                   "description": "Place a new order in the store",

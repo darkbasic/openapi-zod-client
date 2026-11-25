@@ -1,6 +1,6 @@
 import { getZodSchema } from "../src";
 import { expect, test } from "vitest";
-import { getZodChain } from "../src/openApiToZod";
+import { applyUseSite } from "../src/openApiToZod";
 import { SchemaObject } from "openapi3-ts";
 
 test("unicode-pattern-regex", () => {
@@ -19,17 +19,19 @@ test("unicode-pattern-regex", () => {
     const schemaWithSlashU: SchemaObject = {
         type: "string",
         pattern: "\\u{1F600}+",
-    }
-    expect(getZodSchema({ schema: schema }) + getZodChain({ schema })).toMatchInlineSnapshot(
+    };
+    expect(applyUseSite(getZodSchema({ schema }).toString(), { schema })).toMatchInlineSnapshot(
         '"z.string().regex(/\\p{L}+/u).optional()"'
     );
-    expect(getZodSchema({ schema: schemaWithSlashes }) + getZodChain({ schema: schemaWithSlashes })).toMatchInlineSnapshot(
-        '"z.string().regex(/\\p{L}+/u).optional()"'
-    );
-    expect(getZodSchema({ schema: schemaWithComplexUnicodePattern }) + getZodChain({ schema: schemaWithComplexUnicodePattern })).toMatchInlineSnapshot(
-        '"z.string().regex(/$|^[\\p{L}\\d]+[\\p{L}\\d\\s.&()\\*\'\',-;#]*|$/u).optional()"'
-    );
-    expect(getZodSchema({ schema: schemaWithSlashU }) + getZodChain({ schema: schemaWithSlashU })).toMatchInlineSnapshot(
-        '"z.string().regex(/\\u{1F600}+/u).optional()"'
-    );
+    expect(
+        applyUseSite(getZodSchema({ schema: schemaWithSlashes }).toString(), { schema: schemaWithSlashes })
+    ).toMatchInlineSnapshot(`"z.string().regex(/\\/\\p{L}+\\//u).optional()"`);
+    expect(
+        applyUseSite(getZodSchema({ schema: schemaWithComplexUnicodePattern }).toString(), {
+            schema: schemaWithComplexUnicodePattern,
+        })
+    ).toMatchInlineSnapshot("\"z.string().regex(/$|^[\\p{L}\\d]+[\\p{L}\\d\\s.&()\\*'',-;#]*|$/u).optional()\"");
+    expect(
+        applyUseSite(getZodSchema({ schema: schemaWithSlashU }).toString(), { schema: schemaWithSlashU })
+    ).toMatchInlineSnapshot('"z.string().regex(/\\u{1F600}+/u).optional()"');
 });

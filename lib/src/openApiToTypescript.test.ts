@@ -128,7 +128,7 @@ test("getSchemaAsTsString", () => {
       "export type ObjectWithAdditionalPropsNb = {
           str?: string | undefined;
       } & {
-          [key: string]: number;
+          [key: string]: number | (string | undefined);
       };"
     `);
 
@@ -147,7 +147,7 @@ test("getSchemaAsTsString", () => {
       } & {
           [key: string]: {
               prop?: boolean | undefined;
-          };
+          } | (string | undefined);
       };"
     `);
 
@@ -707,8 +707,8 @@ test("getSchemaAsTsString with readonly", () => {
     ).toMatchInlineSnapshot(`
       "export type ObjectWithAdditionalPropsNb = Readonly<{
           str?: string | undefined;
-      } & {
-          [key: string]: number;
+      }> & Readonly<{
+          [key: string]: number | (string | undefined);
       }>;"
     `);
 
@@ -725,10 +725,10 @@ test("getSchemaAsTsString with readonly", () => {
     ).toMatchInlineSnapshot(`
       "export type ObjectWithNestedRecordBoolean = Readonly<{
           str?: string | undefined;
-      } & {
+      }> & Readonly<{
           [key: string]: Readonly<{
               prop?: boolean | undefined;
-          }>;
+          }> | (string | undefined);
       }>;"
     `);
 

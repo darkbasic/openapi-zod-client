@@ -16,5 +16,5 @@ test("required-additional-props-not-in-properties", () => {
                 required: ['name', 'email', 'phone'],
             },
         })
-    ).toMatchInlineSnapshot('"z.object({ name: z.string(), email: z.string() }).passthrough()"');
+    ).toMatchInlineSnapshot(`"z.object({ name: z.string(), email: z.string(), "phone": z.custom<globalThis.NonNullable<unknown> | null>((value) => value !== undefined) }).passthrough()"`);
 });

@@ -88,6 +88,8 @@ export const generateZodClientFromOpenAPI = async <TOptions extends TemplateCont
                 commonTemplate({
                     schemas: pick(data.schemas, commonSchemaNames),
                     types: pick(data.types, commonSchemaNames),
+                    emittedType: data.emittedType,
+                    inputType: data.inputType,
                 }),
                 prettierConfig
             );

@@ -51,7 +51,7 @@ test("schema-type-list-3.1", async () => {
         z
           .object({
             text1: z.string(),
-            name: z.union([z.enum(["Dogs", "Cats", "Mice"]), z.null()]),
+            name: z.union([z.enum(["Dogs", "Cats", "Mice"]), z.never()]),
             another: z.union([z.enum(["Dogs", "Cats", "Mice"]), z.never()]),
           })
           .partial()

@@ -11,11 +11,12 @@ import SwaggerParser from "@apidevtools/swagger-parser";
 import { ModuleKind, transpileModule } from "typescript";
 import { expect, test } from "vitest";
 import { z } from "zod";
+import { typeErrors } from "./typeErrors";
 
 const runFile = promisify(execFile);
 const libraryDirectory = resolve(__dirname, "..");
 
-async function generateThingSchema(input: string, outputPath: string): Promise<z.ZodTypeAny> {
+async function generateThingSchema(input: string, outputPath: string, exportAllSchemas = true): Promise<z.ZodTypeAny> {
     await runFile(
         process.execPath,
         [
@@ -25,7 +26,7 @@ async function generateThingSchema(input: string, outputPath: string): Promise<z
             outputPath,
             "--template",
             join(libraryDirectory, "src/templates/schemas-only.hbs"),
-            "--export-schemas",
+            ...(exportAllSchemas ? ["--export-schemas"] : []),
         ],
         { cwd: libraryDirectory }
     );
@@ -160,3 +161,68 @@ test.each(["3.0.3", "3.1.2"])(
     },
     30_000
 );
+
+test("the CLI infers declared properties and extra values in mixed dictionaries", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openapi-zod-client-mixed-"));
+    try {
+        const input = join(directory, "openapi.json");
+        const output = join(directory, "schemas.ts");
+        const dictionary = {
+            type: "object",
+            properties: { name: { type: "string" } },
+            additionalProperties: { type: "number" },
+        };
+        await writeFile(
+            input,
+            JSON.stringify({
+                openapi: "3.1.0",
+                info: { title: "Mixed dictionaries", version: "1" },
+                paths: {
+                    "/thing": {
+                        get: {
+                            responses: {
+                                "200": {
+                                    description: "Thing",
+                                    content: { "application/json": { schema: { $ref: "#/components/schemas/Thing" } } },
+                                },
+                            },
+                        },
+                    },
+                },
+                components: {
+                    schemas: {
+                        Counts: { ...dictionary, required: ["name", "total"] },
+                        Thing: {
+                            type: "object",
+                            required: ["counts", "details"],
+                            properties: {
+                                counts: { $ref: "#/components/schemas/Counts" },
+                                details: { ...dictionary, required: ["name"] },
+                            },
+                        },
+                    },
+                },
+            })
+        );
+        const schema = await generateThingSchema(input, output, false);
+        const valid = { counts: { name: "A", total: 1, extra: 2 }, details: { name: "B", extra: 3 } };
+        expect(schema.parse(valid)).toEqual(valid);
+        expect(schema.safeParse({ ...valid, details: { name: "B", extra: "invalid" } }).success).toBe(false);
+        const source = await readFile(output, "utf8");
+        expect(
+            typeErrors(`${source}
+const input: z.input<typeof Thing> = ${JSON.stringify(valid)};
+const output: z.output<typeof Thing> = ${JSON.stringify(valid)};
+const name: string = output.details.name;
+const total: number = input.counts.total;
+Counts.shape.name.min(1);
+Thing.shape.details.shape.name.min(1);
+// @ts-expect-error a declared property keeps its own constraint
+const wrongName: typeof input.details = { name: 3 };
+// @ts-expect-error the catchall still requires a numeric total
+const wrongTotal: typeof input.counts = { name: "A", total: "no" };`)
+        ).toEqual([]);
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}, 30_000);

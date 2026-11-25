@@ -11,11 +11,11 @@ const getSchemaAsZodString = (schema: SchemaObject, meta?: CodeMetaData | undefi
 
 test("getSchemaAsZodString", () => {
     expect(getSchemaAsZodString({ type: "null" })).toMatchInlineSnapshot('"z.null()"');
-    expect(getSchemaAsZodString({ type: "null", enum: ["Dogs", "Cats", "Mice"] })).toMatchInlineSnapshot('"z.null()"');
+    expect(getSchemaAsZodString({ type: "null", enum: ["Dogs", "Cats", "Mice"] })).toMatchInlineSnapshot(`"z.never()"`);
     expect(getSchemaAsZodString({ type: "boolean" })).toMatchInlineSnapshot('"z.boolean()"');
     expect(getSchemaAsZodString({ type: "string" })).toMatchInlineSnapshot('"z.string()"');
     expect(getSchemaAsZodString({ type: "number" })).toMatchInlineSnapshot('"z.number()"');
-    expect(getSchemaAsZodString({ type: "integer" })).toMatchInlineSnapshot('"z.number()"');
+    expect(getSchemaAsZodString({ type: "integer" })).toMatchInlineSnapshot(`"z.number().int()"`);
     // expect(getSchemaAsZodString({ type: "string", format: "date-time" })).toMatchInlineSnapshot('"z.string().datetime()"');
     // expect(getSchemaAsZodString({ type: "number", nullable: true, minimum: 0 })).toMatchInlineSnapshot('"z.number().nullable().gte(0)"');
 
@@ -187,9 +187,9 @@ test("getSchemaAsZodString", () => {
 
         })
     ).toMatchInlineSnapshot(`
-    "
-                    z.discriminatedUnion("type", [z.object({ type: z.literal("a"), a: z.string() }).passthrough(), z.object({ type: z.literal("b"), b: z.string() }).passthrough()])
-                "
+      "
+                      z.discriminatedUnion("type", [z.object({ type: z.literal("a"), a: z.string() }).passthrough(), z.object({ type: z.literal("b"), b: z.string() }).passthrough()])
+                  "
     `);
 
     // returns z.union, when allOf has multiple objects
@@ -263,7 +263,7 @@ test("getSchemaAsZodString", () => {
             discriminator: { propertyName: "type" },
 
         })
-    ).toMatchInlineSnapshot('"z.union([z.object({ type: z.literal("a"), a: z.string() }).passthrough().and(z.object({ type: z.literal("c"), c: z.string() }).passthrough()), z.object({ type: z.literal("b"), b: z.string() }).passthrough().and(z.object({ type: z.literal("d"), d: z.string() }).passthrough())])"');
+    ).toMatchInlineSnapshot(`"z.union([z.object({ type: z.literal("a"), a: z.string() }).passthrough().and(z.object({ type: z.literal("c"), c: z.string() }).passthrough()), z.object({ type: z.literal("b"), b: z.string() }).passthrough().and(z.object({ type: z.literal("d"), d: z.string() }).passthrough())])"`);
 
     expect(
         getSchemaAsZodString({
@@ -448,6 +448,7 @@ test("CodeMeta with nested refs", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -466,8 +467,8 @@ test("binary string format with maxLength should not add max validation", () => 
         getSchemaAsZodString({ type: "object", properties: { file: { type: "string", format: "binary", maxLength: 20480 } } })
     ).toMatchInlineSnapshot('"z.object({ file: z.instanceof(File) }).partial().passthrough()"');
 
-    // For comparison: regular string with maxLength should have .max()
+    // Text still enforces the bound in Unicode code points.
     expect(
         getSchemaAsZodString({ type: "object", properties: { text: { type: "string", maxLength: 20480 } } })
-    ).toMatchInlineSnapshot('"z.object({ text: z.string().max(20480) }).partial().passthrough()"');
+    ).toMatchInlineSnapshot(`"z.object({ text: z.string().regex(/^[\\s\\S]{0,20480}$/u) }).partial().passthrough()"`);
 });

@@ -1,6 +1,7 @@
 import type { OpenAPIObject, SchemaObject } from "openapi3-ts";
 import { get } from "pastable/server";
 
+import { normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import { normalizeString } from "./utils";
 
 const autocorrectRef = (ref: string) => (ref[1] === "/" ? ref : "#/" + ref.slice(1));
@@ -18,6 +19,7 @@ export const makeSchemaResolver = (doc: OpenAPIObject) => {
     // eslint-disable-next-line sonarjs/no-unused-collection
     const refByName = new Map<string, string>();
 
+    const normalizedSchemas = new WeakMap<object, SchemaObject>();
     const byRef = new Map<string, RefInfo>();
     const byNormalized = new Map<string, RefInfo>();
 
@@ -42,10 +44,14 @@ export const makeSchemaResolver = (doc: OpenAPIObject) => {
         byNormalized.set(infos.normalized, infos);
 
         // doc.components.schemas["Something.jsonld"]
-        return map[name] as SchemaObject;
+        const schema = map[name] as SchemaObject;
+        return schema != null && correctRef.startsWith("#/components/schemas/")
+            ? normalizeBooleanSchema(schema, normalizedSchemas)
+            : schema;
     };
 
     return {
+        supportsSchemaRefSiblings: !!doc.openapi && !doc.openapi.startsWith("3.0."),
         getSchemaByRef,
         resolveRef: (ref: string) => byRef.get(autocorrectRef(ref))!,
         resolveSchemaName: (normalized: string) => byNormalized.get(normalized)!,

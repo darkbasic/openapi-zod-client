@@ -51,25 +51,18 @@ test("missing-zod-chains-on-z-object-with-refs-props", async () => {
       "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
       import { z } from "zod";
 
-      const Email = z.string();
-      const Password = z.string();
-      const AddUser = z
-        .object({
-          email: Email.min(6)
-            .max(255)
-            .regex(/(EmailRegex)/),
-          password: Password.min(16)
-            .max(255)
-            .regex(/(PasswordRegex)/),
-        })
-        .passthrough();
-      const PasswordReminder = z
-        .object({
-          email: Email.min(6)
-            .max(255)
-            .regex(/(EmailRegex)/),
-        })
-        .passthrough();
+      const Email = z
+        .string()
+        .regex(/^[\\s\\S]{6}/u)
+        .regex(/^[\\s\\S]{0,255}$/u)
+        .regex(/\\/(EmailRegex)\\//u);
+      const Password = z
+        .string()
+        .regex(/^[\\s\\S]{16}/u)
+        .regex(/^[\\s\\S]{0,255}$/u)
+        .regex(/\\/(PasswordRegex)\\//u);
+      const AddUser = z.object({ email: Email, password: Password }).passthrough();
+      const PasswordReminder = z.object({ email: Email }).passthrough();
 
       export const schemas = {
         Email,
@@ -87,16 +80,7 @@ test("missing-zod-chains-on-z-object-with-refs-props", async () => {
             {
               name: "body",
               type: "Body",
-              schema: z
-                .object({
-                  email: Email.min(6)
-                    .max(255)
-                    .regex(/(EmailRegex)/),
-                  password: Password.min(16)
-                    .max(255)
-                    .regex(/(PasswordRegex)/),
-                })
-                .passthrough(),
+              schema: z.object({ email: Email, password: Password }).passthrough(),
             },
           ],
           response: z.void(),
@@ -109,13 +93,7 @@ test("missing-zod-chains-on-z-object-with-refs-props", async () => {
             {
               name: "body",
               type: "Body",
-              schema: z
-                .object({
-                  email: Email.min(6)
-                    .max(255)
-                    .regex(/(EmailRegex)/),
-                })
-                .passthrough(),
+              schema: z.object({ email: Email }).passthrough(),
             },
           ],
           response: z.void(),

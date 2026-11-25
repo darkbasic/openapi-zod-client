@@ -51,6 +51,7 @@ test("resolve-ref-responses", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {},

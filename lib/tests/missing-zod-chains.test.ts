@@ -59,14 +59,17 @@ test("missing-zod-chains", async () => {
       "import { makeApi, Zodios, type ZodiosOptions } from "@zodios/core";
       import { z } from "zod";
 
-      const test1 = z.string();
-      const test2 = z.number();
+      const test1 = z.string().regex(/^[\\s\\S]{5}/u);
+      const test2 = z.number().int().gte(10);
       const test3 = z
-        .object({ text: z.string().min(5), num: z.number().int().gte(10) })
+        .object({
+          text: z.string().regex(/^[\\s\\S]{5}/u),
+          num: z.number().int().gte(10),
+        })
         .passthrough();
-      const nulltype = z.object({}).partial().passthrough();
+      const nulltype = z.object({}).partial().passthrough().nullable();
       const anyOfType = z.union([
-        z.object({}).partial().passthrough(),
+        z.object({}).partial().passthrough().nullable(),
         z.object({ foo: z.string() }).partial().passthrough(),
       ]);
 
@@ -83,7 +86,7 @@ test("missing-zod-chains", async () => {
           method: "put",
           path: "/pet",
           requestFormat: "json",
-          response: z.string().min(5),
+          response: z.string().regex(/^[\\s\\S]{5}/u),
           errors: [
             {
               status: 401,
@@ -94,7 +97,10 @@ test("missing-zod-chains", async () => {
               status: 402,
               description: \`Successful operation\`,
               schema: z
-                .object({ text: z.string().min(5), num: z.number().int().gte(10) })
+                .object({
+                  text: z.string().regex(/^[\\s\\S]{5}/u),
+                  num: z.number().int().gte(10),
+                })
                 .passthrough(),
             },
             {

@@ -58,12 +58,28 @@ test("enum-min-max", async () => {
             {
               name: "foo",
               type: "Query",
-              schema: z.union([z.literal(1), z.literal(-2), z.literal(3)]).optional(),
+              schema: z
+                .union([z.literal(1), z.literal(-2), z.literal(3)])
+                .refine(
+                  (
+                    (check) => (value: unknown) =>
+                      check.safeParse(value).success
+                  )(z.number().gte(4).lte(10))
+                )
+                .optional(),
             },
             {
               name: "bar",
               type: "Query",
-              schema: z.enum(["Dogs", "Cats", "Mice"]).optional(),
+              schema: z
+                .enum(["Dogs", "Cats", "Mice"])
+                .refine(
+                  (
+                    (check) => (value: unknown) =>
+                      check.safeParse(value).success
+                  )(z.string().regex(/^[\\s\\S]{4}/u))
+                )
+                .optional(),
             },
           ],
           response: z.void(),

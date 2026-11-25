@@ -66,6 +66,7 @@ test("autofix-unusual-ref-format", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {

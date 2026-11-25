@@ -1,33 +1,43 @@
-import { fileURLToPath } from "node:url";
+import { transpileModule } from "typescript";
 import type { OpenAPIObject } from "openapi3-ts";
-import ts from "typescript";
 import { expect, test } from "vitest";
 import { z } from "zod";
 import { getZodClientTemplateContext } from "../src/template-context";
+import { typeErrors } from "./typeErrors";
 
-function typeErrors(source: string): string[] {
-    const filename = fileURLToPath(new URL("./.generated-anyOf-types.ts", import.meta.url));
-    const options: ts.CompilerOptions = {
-        strict: true,
-        exactOptionalPropertyTypes: true,
-        noEmit: true,
-        skipLibCheck: true,
-        target: ts.ScriptTarget.ES2020,
-        module: ts.ModuleKind.CommonJS,
-        moduleResolution: ts.ModuleResolutionKind.NodeJs,
-        types: [],
-    };
-    const host = ts.createCompilerHost(options);
-    const getSourceFile = host.getSourceFile.bind(host);
-    host.getSourceFile = (name, languageVersion, onError, shouldCreateNewSourceFile) =>
-        name === filename
-            ? ts.createSourceFile(name, source, languageVersion, true)
-            : getSourceFile(name, languageVersion, onError, shouldCreateNewSourceFile);
-
-    return ts
-        .getPreEmitDiagnostics(ts.createProgram([filename], options, host))
-        .map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"));
-}
+test("a readonly dictionary can reference itself through an anyOf value", () => {
+    const context = getZodClientTemplateContext(
+        {
+            openapi: "3.1.0",
+            info: { title: "Recursive dictionary", version: "1" },
+            paths: {},
+            components: {
+                schemas: {
+                    Tree: {
+                        type: "object",
+                        required: ["primary"],
+                        additionalProperties: {
+                            anyOf: [{ $ref: "#/components/schemas/Tree" }, { type: "string" }, { type: "null" }],
+                        },
+                    },
+                },
+            },
+        },
+        { shouldExportAllSchemas: true, allReadonly: true }
+    );
+    expect(
+        typeErrors(`import { z } from "zod";
+${context.types.Tree}
+const Tree: z.ZodType<Tree> = ${context.schemas.Tree};
+const tree: Tree = { primary: { primary: "leaf" }, extra: null };
+// @ts-expect-error the named key is readonly
+tree.primary = null;
+// @ts-expect-error the index signature is readonly
+tree.extra = "leaf";
+// @ts-expect-error every level requires its primary entry
+const invalid: Tree = { primary: {} };`)
+    ).toEqual([]);
+});
 
 test.each([false, true])("anyOf types match runtime unions (readonly: %s)", (allReadonly) => {
     const document: OpenAPIObject = {
@@ -36,7 +46,7 @@ test.each([false, true])("anyOf types match runtime unions (readonly: %s)", (all
         paths: {},
         components: {
             schemas: {
-                Status: { type: "string", enum: ["ready", 'quoted "label"', null] },
+                Status: { type: ["string", "null"], enum: ["ready", 'quoted "label"', null] },
                 Mixed: {
                     type: ["string", "integer", "boolean", "null"],
                     enum: ["ready", -1, 0, true, false, null],
@@ -68,7 +78,9 @@ test.each([false, true])("anyOf types match runtime unions (readonly: %s)", (all
         const declarations = Object.entries(context.schemas)
             .map(([name, expression]) => `const ${name} = ${expression};`)
             .join("\n");
-        const schema: z.ZodTypeAny = new Function("z", `${declarations}\nreturn Node;`)(z);
+        const schema: z.ZodTypeAny = new Function("z", transpileModule(declarations, {}).outputText + "\nreturn Node;")(
+            z
+        );
         const valid = { status: "ready", mixed: -1, parent: null, choice: null, children: [] };
 
         expect(schema.safeParse(valid).success).toBe(true);

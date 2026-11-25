@@ -17,8 +17,10 @@ import type { CodeMeta, ConversionTypeContext } from "./CodeMeta";
 import { getOpenApiDependencyGraph } from "./getOpenApiDependencyGraph";
 import { isReferenceObject } from "./isReferenceObject";
 import { makeSchemaResolver } from "./makeSchemaResolver";
-import { getZodChain, getZodSchema } from "./openApiToZod";
+import { normalizeBooleanSchema } from "./normalizeBooleanSchema";
+import { applyUseSite, getZodSchema } from "./openApiToZod";
 import { getSchemaComplexity } from "./schema-complexity";
+import { schemaAssertionParts, schemaNegation } from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
 import {
     asComponentSchema,
@@ -35,7 +37,8 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
     const resolver = makeSchemaResolver(doc);
     const graphs = getOpenApiDependencyGraph(
         Object.keys(doc.components?.schemas ?? {}).map((name) => asComponentSchema(name)),
-        resolver.getSchemaByRef
+        resolver.getSchemaByRef,
+        resolver.supportsSchemaRefSiblings
     );
 
     const endpoints = [];
@@ -64,7 +67,12 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
         )
         .otherwise((fn) => fn);
 
-    const ctx: ConversionTypeContext = { resolver, zodSchemaByName: {}, schemaByName: {} };
+    const ctx: ConversionTypeContext = {
+        resolver,
+        deepDependencyGraph: graphs.deepDependencyGraph,
+        zodSchemaByName: {},
+        schemaByName: {},
+    };
     if (options?.exportAllNamedSchemas) {
         ctx.schemasByName = {};
     }
@@ -182,8 +190,8 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                 const mediaTypes = Object.keys(requestBody.content ?? {});
                 const matchingMediaType = mediaTypes.find(isAllowedParamMediaTypes);
 
-                const bodySchema = matchingMediaType && requestBody.content?.[matchingMediaType]?.schema;
-                if (bodySchema) {
+                const bodySchema = matchingMediaType ? requestBody.content?.[matchingMediaType]?.schema : undefined;
+                if (bodySchema != null) {
                     endpointDefinition.requestFormat = match(matchingMediaType)
                         .with("application/octet-stream", () => "binary" as const)
                         .with("application/x-www-form-urlencoded", () => "form-url" as const)
@@ -202,14 +210,12 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                         name: "body",
                         type: "Body",
                         description: requestBody.description!,
-                        schema:
-                            getZodVarName(bodyCode, operationName + "_Body") +
-                            getZodChain({
-                                schema: isReferenceObject(bodySchema)
-                                    ? ctx.resolver.getSchemaByRef(bodySchema.$ref)
-                                    : bodySchema,
-                                meta: bodyCode.meta,
-                            }),
+                        schema: applyUseSite(getZodVarName(bodyCode, operationName + "_Body"), {
+                            ctx,
+                            schema: bodySchema,
+                            meta: bodyCode.meta,
+                            options,
+                        }),
                     });
                 }
             }
@@ -243,21 +249,25 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                         // @ts-expect-error
                         paramSchema = mediaTypeObject?.schema ?? mediaTypeObject;
                     } else {
-                        paramSchema = isReferenceObject(paramItem.schema)
-                            ? ctx.resolver.getSchemaByRef(paramItem.schema.$ref)
-                            : paramItem.schema;
+                        paramSchema = paramItem.schema;
                     }
 
-                    if (options?.withDescription && paramSchema) {
-                        (paramSchema as SchemaObject).description = (paramItem.description ?? "").trim();
+                    if (paramSchema != null) paramSchema = normalizeBooleanSchema(paramSchema);
+
+                    // Plain parameter references are inlined. In 3.1, sibling assertions also constrain the input.
+                    if (
+                        isReferenceObject(paramSchema) &&
+                        !(ctx.resolver.supportsSchemaRefSiblings && "default" in paramSchema) &&
+                        !schemaAssertionParts(paramSchema, ctx.resolver) &&
+                        !schemaNegation(paramSchema, ctx.resolver)
+                    ) {
+                        paramSchema = ctx.resolver.getSchemaByRef(paramSchema.$ref);
                     }
 
-                    // resolve ref if needed, and fallback to default (unknown) value if needed
-                    paramSchema = paramSchema
-                        ? (isReferenceObject(paramSchema)
-                              ? ctx.resolver.getSchemaByRef(paramSchema.$ref)
-                              : paramSchema)!
-                        : {};
+                    paramSchema ??= {};
+                    if (options?.withDescription) {
+                        paramSchema = { ...paramSchema, description: (paramItem.description ?? "").trim() };
+                    }
 
                     const paramCode = getZodSchema({
                         schema: paramSchema ?? {},
@@ -266,6 +276,17 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                         options,
                     });
 
+                    // Resolve a component name before wrapping its input. The wrapped expression is
+                    // no longer a reference and cannot be looked up as a component name.
+                    const paramExpression = applyUseSite(
+                        paramCode.ref ? getZodVarName(paramCode) : paramCode.toString(),
+                        {
+                            schema: paramSchema,
+                            ctx,
+                            meta: paramCode.meta,
+                            options,
+                        }
+                    );
                     endpointDefinition.parameters.push({
                         name: match(paramItem.in)
                             .with("path", () => pathParamToVariableName(paramItem.name))
@@ -275,13 +296,9 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                             .with("query", () => "Query")
                             .with("path", () => "Path")
                             .run() as "Header" | "Query" | "Path",
-                        schema: getZodVarName(
-                            paramCode.assign(
-                                paramCode.toString() +
-                                    getZodChain({ schema: paramSchema, meta: paramCode.meta, options })
-                            ),
-                            paramItem.name
-                        ),
+                        schema: paramCode.ref
+                            ? paramExpression
+                            : getZodVarName(paramCode.assign(paramExpression), paramItem.name),
                     });
                 }
             }
@@ -305,16 +322,14 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                 let schemaString = matchingMediaType ? undefined : voidSchema;
                 let schema: CodeMeta | undefined;
 
-                if (maybeSchema) {
+                if (maybeSchema != null) {
                     schema = getZodSchema({ schema: maybeSchema, ctx, meta: { isRequired: true }, options });
-                    schemaString =
-                        (schema.ref ? getZodVarName(schema) : schema.toString()) +
-                        getZodChain({
-                            schema: isReferenceObject(maybeSchema)
-                                ? ctx.resolver.getSchemaByRef(maybeSchema.$ref)
-                                : maybeSchema,
-                            meta: schema.meta,
-                        });
+                    schemaString = applyUseSite(schema.ref ? getZodVarName(schema) : schema.toString(), {
+                        ctx,
+                        schema: maybeSchema,
+                        meta: schema.meta,
+                        options,
+                    });
                 }
 
                 if (endpointDefinition.responses !== undefined) {
@@ -357,20 +372,18 @@ export const getZodiosEndpointDefinitionList = (doc: OpenAPIObject, options?: Te
                 const mediaTypes = Object.keys(responseItem.content ?? {});
                 const matchingMediaType = mediaTypes.find(isMediaTypeAllowed);
 
-                const maybeSchema = matchingMediaType && responseItem.content?.[matchingMediaType]?.schema;
+                const maybeSchema = matchingMediaType ? responseItem.content?.[matchingMediaType]?.schema : undefined;
                 let schemaString = matchingMediaType ? undefined : voidSchema;
                 let schema: CodeMeta | undefined;
 
-                if (maybeSchema) {
+                if (maybeSchema != null) {
                     schema = getZodSchema({ schema: maybeSchema, ctx, meta: { isRequired: true }, options });
-                    schemaString =
-                        (schema.ref ? getZodVarName(schema) : schema.toString()) +
-                        getZodChain({
-                            schema: isReferenceObject(maybeSchema)
-                                ? ctx.resolver.getSchemaByRef(maybeSchema.$ref)
-                                : maybeSchema,
-                            meta: schema.meta,
-                        });
+                    schemaString = applyUseSite(schema.ref ? getZodVarName(schema) : schema.toString(), {
+                        ctx,
+                        schema: maybeSchema,
+                        meta: schema.meta,
+                        options,
+                    });
                 }
 
                 if (schemaString) {

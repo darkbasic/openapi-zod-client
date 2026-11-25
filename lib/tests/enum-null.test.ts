@@ -112,7 +112,9 @@ test("enum-null", async () => {
       import { z } from "zod";
 
       type Compound = {
-        field?: (Null1 | Null2 | Null3 | Null4 | string) | undefined;
+        field?:
+          | ((Null1 | Null2 | Null3 | Null4 | string) & ({} | undefined))
+          | undefined;
       };
       type Null1 = null;
       type Null2 = "a" | null;
@@ -124,7 +126,20 @@ test("enum-null", async () => {
       const Null3: z.ZodType<Null3> = z.literal("a").nullable();
       const Null4: z.ZodType<Null4> = z.null();
       const Compound: z.ZodType<Compound> = z
-        .object({ field: z.union([Null1, Null2, Null3, Null4, z.string()]) })
+        .object({
+          field: ((schema) =>
+            z
+              .custom<
+                z.input<typeof schema> & (globalThis.NonNullable<unknown> | undefined)
+              >((value) => value !== null)
+              .pipe(schema)
+              .refine(
+                (
+                  value
+                ): value is typeof value &
+                  (globalThis.NonNullable<unknown> | undefined) => value !== null
+              ))(z.union([Null1, Null2, Null3, Null4, z.string()])),
+        })
         .partial()
         .passthrough();
 

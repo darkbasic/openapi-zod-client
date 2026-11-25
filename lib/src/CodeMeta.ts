@@ -6,6 +6,8 @@ import { getSchemaComplexity } from "./schema-complexity";
 
 export type ConversionTypeContext = {
     resolver: DocumentResolver;
+    deepDependencyGraph?: Record<string, Set<string>>;
+    needsStableRecursiveDefaults?: boolean;
     zodSchemaByName: Record<string, string>;
     schemaByName: Record<string, string>;
     schemasByName?: Record<string, string[]>;

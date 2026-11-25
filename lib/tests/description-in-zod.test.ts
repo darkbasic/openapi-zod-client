@@ -94,9 +94,7 @@ const endpoints = makeApi([
         type: "Query",
         schema: z
           .union([z.literal(1.3), z.literal(34.1), z.literal(-57.89)])
-          .describe(
-            \`baz\nmultiline\ndescription\`
-          )
+          .describe("baz\\nmultiline\\ndescription")
           .optional(),
       },
       {

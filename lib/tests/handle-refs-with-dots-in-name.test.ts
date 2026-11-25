@@ -90,6 +90,7 @@ test("handle-refs-with-dots-in-name", async () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {

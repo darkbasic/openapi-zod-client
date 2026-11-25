@@ -28,7 +28,8 @@ export const getZodClientTemplateContext = (
     const docSchemas = openApiDoc.components?.schemas ?? {};
     const depsGraphs = getOpenApiDependencyGraph(
         Object.keys(docSchemas).map((name) => asComponentSchema(name)),
-        result.resolver.getSchemaByRef
+        result.resolver.getSchemaByRef,
+        result.resolver.supportsSchemaRefSiblings
     );
 
     if (options?.shouldExportAllSchemas) {
@@ -42,34 +43,48 @@ export const getZodClientTemplateContext = (
     const wrapWithLazyIfNeeded = (schemaName: string) => {
         const [code, ref] = [result.zodSchemaByName[schemaName]!, result.resolver.resolveSchemaName(schemaName)?.ref];
         const isCircular = ref && depsGraphs.deepDependencyGraph[ref]?.has(ref);
-        if (isCircular) {
-            data.circularTypeByName[schemaName] = true;
+        if (!isCircular) return code;
+        data.circularTypeByName[schemaName] = true;
+        if (result.needsStableRecursiveDefaults) {
+            // Keep each recursive default's re-entry guard alive while it validates its own candidate.
+            return `((build) => { let cached: globalThis.ReturnType<typeof build> | undefined;
+                return z.lazy(() => cached ??= build()); })(() => ${code})`;
         }
 
-        return isCircular ? `z.lazy(() => ${code})` : code;
+        return `z.lazy(() => ${code})`;
     };
 
     for (const name in result.zodSchemaByName) {
         data.schemas[normalizeString(name)] = wrapWithLazyIfNeeded(name);
     }
 
+    const emitType = (name: string, schema: SchemaObject, annotate: boolean) => {
+        const ctx: TsConversionContext = { nodeByRef: {}, resolver: result.resolver, visitedsRefs: {} };
+        const emit = (typeName: string) => {
+            const node = getTypescriptFromOpenApi({ schema, ctx, meta: { name: typeName }, options }) as ts.Node;
+            return printTs(node).replace("export ", "");
+        };
+
+        data.types[name] = emit(name);
+        if (!annotate) return;
+
+        data.emittedType[name] = true;
+        if (ctx.hasDistinctInput && Object.hasOwn(data.schemas, name)) {
+            const inputName = `$${name}Input`;
+            (data.inputType ??= {})[name] = inputName;
+            ctx.input = true;
+            data.types[name] += "\n" + emit(inputName);
+        }
+    };
+
     for (const ref in depsGraphs.deepDependencyGraph) {
         const isCircular = ref && depsGraphs.deepDependencyGraph[ref]?.has(ref);
-        const ctx: TsConversionContext = { nodeByRef: {}, resolver: result.resolver, visitedsRefs: {} };
-
         // Specifically check isCircular if shouldExportAllTypes is false. Either should cause shouldGenerateType to be true.
         // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
         const shouldGenerateType = options?.shouldExportAllTypes || isCircular;
         const schemaName = shouldGenerateType ? result.resolver.resolveRef(ref).normalized : undefined;
         if (shouldGenerateType && schemaName && !data.types[schemaName]) {
-            const node = getTypescriptFromOpenApi({
-                schema: result.resolver.getSchemaByRef(ref),
-                ctx,
-                meta: { name: schemaName },
-                options,
-            }) as ts.Node;
-            data.types[schemaName] = printTs(node).replace("export ", "");
-            data.emittedType[schemaName] = true;
+            emitType(schemaName, result.resolver.getSchemaByRef(ref), true);
 
             for (const depRef of depsGraphs.deepDependencyGraph[ref] ?? []) {
                 const depSchemaName = result.resolver.resolveRef(depRef).normalized;
@@ -77,35 +92,33 @@ export const getZodClientTemplateContext = (
 
                 if (!isDepCircular && !data.types[depSchemaName]) {
                     const nodeSchema = result.resolver.getSchemaByRef(depRef);
-                    const node = getTypescriptFromOpenApi({
-                        schema: nodeSchema,
-                        ctx,
-                        meta: { name: depSchemaName },
-                        options,
-                    }) as ts.Node;
-                    data.types[depSchemaName] = printTs(node).replace("export ", "");
-                    // defining types for strings and using the `z.ZodType<string>` type for their schema
-                    // prevents consumers of the type from adding zod validations like `.min()` to the type
-                    if (options?.shouldExportAllTypes && nodeSchema.type === "object") {
-                        data.emittedType[depSchemaName] = true;
-                    }
-
-                    // Also set emittedType for enum dependencies of circular schemas to ensure proper type annotations
-                    if (nodeSchema.type === "string" && nodeSchema.enum) {
-                        data.emittedType[depSchemaName] = true;
-                    }
+                    // Keep concrete string validators available to consumers that add methods like .min().
+                    const shouldAnnotate =
+                        (options?.shouldExportAllTypes && nodeSchema.type === "object") ||
+                        (nodeSchema.type === "string" && nodeSchema.enum !== undefined);
+                    emitType(depSchemaName, nodeSchema, shouldAnnotate);
                 }
             }
         }
     }
 
-    // TODO
-    const schemaOrderedByDependencies = topologicalSort(depsGraphs.deepDependencyGraph).map(
-        (ref) => result.resolver.resolveRef(ref).ref
+    // Keep the discovery order of independent declarations and initialize every dependency before its users.
+    const emittedDependencies = Object.fromEntries(
+        Object.keys(data.schemas).map((name) => {
+            const ref = result.resolver.resolveSchemaName(name)?.ref;
+            const deps = ref && !data.circularTypeByName[name] ? depsGraphs.refsDependencyGraph[ref] : undefined;
+            return [
+                name,
+                new Set(Array.from(deps ?? [], (dependency) => result.resolver.resolveRef(dependency).normalized)),
+            ];
+        })
     );
-    data.schemas = sortObjKeysFromArray(data.schemas, schemaOrderedByDependencies);
+    const schemaOrder = topologicalSort(emittedDependencies);
+    data.schemas = sortObjKeysFromArray(data.schemas, schemaOrder);
 
     const groupStrategy = options?.groupStrategy ?? "none";
+    const expressionDependencies =
+        groupStrategy === "none" ? undefined : getGroupedSchemaDependencies(data.schemas, result.endpoints);
     const dependenciesByGroupName = new Map<string, Set<string>>();
 
     result.endpoints.forEach((endpoint) => {
@@ -141,37 +154,24 @@ export const getZodClientTemplateContext = (
 
             const dependencies = dependenciesByGroupName.get(groupName)!;
 
-            const addDependencyIfNeeded = (schemaName: string) => {
-                if (!schemaName) return;
-                if (schemaName.startsWith("z.")) return;
-                // Sometimes the schema includes a chain that should be removed from the dependency
-                const [normalizedSchemaName] = schemaName.split(".");
-                dependencies.add(normalizedSchemaName!);
-            };
+            for (const expression of endpointExpressions(endpoint)) {
+                for (const name of expressionDependencies?.get(expression) ?? []) dependencies.add(name);
+            }
 
-            addDependencyIfNeeded(endpoint.response);
-            endpoint.parameters.forEach((param) => addDependencyIfNeeded(param.schema));
-            endpoint.errors.forEach((param) => addDependencyIfNeeded(param.schema));
-            dependencies.forEach((schemaName) => (group.schemas[schemaName] = data.schemas[schemaName]!));
+            // Include both references in generated expressions and component references used by type annotations.
+            for (const name of dependencies) {
+                group.schemas[name] = data.schemas[name]!;
+                if (!groupStrategy.includes("file")) continue;
 
-            // reduce types/schemas for each group using prev computed deep dependencies
-            if (groupStrategy.includes("file")) {
-                [...dependencies].forEach((schemaName) => {
-                    if (data.types[schemaName]) {
-                        group.types[schemaName] = data.types[schemaName]!;
-                    }
+                if (data.types[name]) group.types[name] = data.types[name]!;
+                const ref = result.resolver.resolveSchemaName(name)?.ref;
+                for (const dependency of depsGraphs.deepDependencyGraph[ref] ?? []) {
+                    dependencies.add(result.resolver.resolveRef(dependency).normalized);
+                }
 
-                    group.schemas[schemaName] = data.schemas[schemaName]!;
-
-                    depsGraphs.deepDependencyGraph[result.resolver.resolveSchemaName(schemaName)?.ref]?.forEach(
-                        (transitiveRef) => {
-                            const transitiveSchemaName = result.resolver.resolveRef(transitiveRef).normalized;
-                            addDependencyIfNeeded(transitiveSchemaName);
-                            group.types[transitiveSchemaName] = data.types[transitiveSchemaName]!;
-                            group.schemas[transitiveSchemaName] = data.schemas[transitiveSchemaName]!;
-                        }
-                    );
-                });
+                for (const dependency of expressionDependencies?.get(group.schemas[name]!) ?? []) {
+                    dependencies.add(dependency);
+                }
             }
         }
     });
@@ -207,12 +207,10 @@ export const getZodClientTemplateContext = (
                 }
             });
 
-            group.schemas = sortObjKeysFromArray(groupSchemas, getPureSchemaNames(schemaOrderedByDependencies));
+            group.schemas = sortObjKeysFromArray(groupSchemas, schemaOrder);
             group.types = groupTypes;
         });
-        data.commonSchemaNames = new Set(
-            sortListFromRefArray(Array.from(commonSchemaNames), getPureSchemaNames(schemaOrderedByDependencies))
-        );
+        data.commonSchemaNames = new Set(sortListFromRefArray(Array.from(commonSchemaNames), schemaOrder));
     }
 
     return data;
@@ -236,12 +234,53 @@ const makeTemplateContext = (): TemplateContext => {
 
 const originalPathParam = /:(\w+)/g;
 const getOriginalPathWithBrackets = (path: string) => path.replaceAll(originalPathParam, "{$1}");
-// Example full schema name is like: #/components/schemas/Category.
-// We only want to get the "Category".
-//
-// This is because when using `sortObjKeysFromArray`, the string array needs to be exactly the same
-// like the object keys. Otherwise, the object keys won't be re-ordered.
-const getPureSchemaNames = (fullSchemaNames: string[]) => fullSchemaNames.map((name) => name.split("/").at(-1)!);
+const endpointExpressions = (endpoint: EndpointDefinitionWithRefs) => [
+    endpoint.response,
+    ...endpoint.parameters.map(({ schema }) => schema),
+    ...endpoint.errors.map(({ schema }) => schema),
+    ...(endpoint.responses ?? []).map(({ schema }) => schema),
+];
+
+// Bind the generated expressions against the schema declarations. Property names, literals and local
+// bindings can all have the same spelling as a schema, but only references to a declaration need imports.
+function getGroupedSchemaDependencies(schemas: Record<string, string>, endpoints: EndpointDefinitionWithRefs[]) {
+    const dependencies = new Map<string, Set<string>>();
+    const names = Object.keys(schemas);
+    if (names.length === 0) return dependencies;
+
+    const expressions = [...new Set([...Object.values(schemas), ...endpoints.flatMap(endpointExpressions)])];
+    const declarations = names.map((name) => `${name}: unknown`).join(", ");
+    const source = ts.createSourceFile(
+        "grouped-schemas.ts",
+        [`export declare const ${declarations};`, ...expressions.map((s) => `(${s});`)].join("\n"),
+        ts.ScriptTarget.Latest,
+        true
+    );
+    const options = { noLib: true, noResolve: true };
+    const host = ts.createCompilerHost(options);
+    host.getSourceFile = (name) => (name === source.fileName ? source : undefined);
+    const checker = ts.createProgram([source.fileName], options, host).getTypeChecker();
+    const bindings = source.statements[0] as ts.VariableStatement;
+    const schemaDeclarations = new Set<ts.Declaration>(bindings.declarationList.declarations);
+    expressions.forEach((expression, index) => {
+        const referenced = new Set<string>();
+        const visit = (node: ts.Node) => {
+            if (ts.isIdentifier(node) && Object.hasOwn(schemas, node.text)) {
+                const symbol = ts.isShorthandPropertyAssignment(node.parent)
+                    ? checker.getShorthandAssignmentValueSymbol(node.parent)
+                    : checker.getSymbolAtLocation(node);
+                const declaration = symbol?.valueDeclaration;
+                if (declaration && schemaDeclarations.has(declaration)) referenced.add(node.text);
+            }
+
+            ts.forEachChild(node, visit);
+        };
+
+        visit(source.statements[index + 1]!);
+        dependencies.set(expression, referenced);
+    });
+    return dependencies;
+}
 
 export type TemplateContext = {
     schemas: Record<string, string>;
@@ -250,6 +289,7 @@ export type TemplateContext = {
     types: Record<string, string>;
     circularTypeByName: Record<string, true>;
     emittedType: Record<string, true>;
+    inputType?: Record<string, string>;
     commonSchemaNames?: Set<string>;
     options?: TemplateContextOptions | undefined;
 };

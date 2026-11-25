@@ -146,6 +146,7 @@ test("getZodiosEndpointDefinitionList /store/order", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -297,6 +298,7 @@ test("getZodiosEndpointDefinitionList /pet", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -437,6 +439,7 @@ test("getZodiosEndpointDefinitionList /pet without schema ref", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {
               "Pet.and(Reason)": "updatePet_Body",
@@ -635,6 +638,7 @@ test("getZodiosEndpointDefinitionList /pet/findXXX", () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -1113,6 +1117,7 @@ test("petstore.yaml", async () => {
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {
@@ -1286,6 +1291,7 @@ test("getZodiosEndpointDefinitionList should return responses if options.withAll
               "getSchemaByRef": [Function],
               "resolveRef": [Function],
               "resolveSchemaName": [Function],
+              "supportsSchemaRefSiblings": false,
           },
           "schemaByName": {},
           "zodSchemaByName": {

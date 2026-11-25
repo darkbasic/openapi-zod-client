@@ -3,11 +3,27 @@ import { t, ts } from "tanu";
 import type { TypeDefinition, TypeDefinitionObject } from "tanu/dist/type";
 
 import generateJSDocArray from "./generateJSDocArray";
-import { inferRequiredSchema } from "./inferRequiredOnly";
 import { isReferenceObject } from "./isReferenceObject";
 import type { DocumentResolver } from "./makeSchemaResolver";
+import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
+import {
+    acceptsNull,
+    applicableStructuralOperand,
+    hasImpossibleRequiredKey,
+    hasStructuralKeywords,
+    hasStructuralLiteral,
+    intersectionOperands,
+    needsCompositionBranchNull,
+    needsNullableChain,
+    normalizeLiteralAssertion,
+    oneOfNullGuard,
+    requiredAdditionalKeys,
+    schemaAssertionParts,
+    schemaNegation,
+    useSiteDefault,
+} from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
-import { wrapWithQuotesIfNeeded } from "./utils";
+import { primitiveEnumValues, wrapWithQuotesIfNeeded } from "./utils";
 
 type TsConversionArgs = {
     schema: SchemaObject | ReferenceObject;
@@ -21,6 +37,8 @@ export type TsConversionContext = {
     resolver: DocumentResolver;
     rootRef?: string;
     visitedsRefs?: Record<string, boolean>;
+    input?: boolean;
+    hasDistinctInput?: boolean;
 };
 
 type MaybeWrapReadOnlyType =
@@ -37,17 +55,25 @@ type MaybeWrapReadOnlyType =
               | ts.EnumDeclaration;
       };
 
-const wrapReadOnly =
-    (options: TemplateContext["options"]) =>
-    (theType: MaybeWrapReadOnlyType): MaybeWrapReadOnlyType => {
-        if (options?.allReadonly) {
-            return t.readonly(theType);
-        }
+const literalType = (value: unknown): TypeDefinition => {
+    if (Array.isArray(value)) return t.tuple(value.map(literalType));
+    if (value && typeof value === "object") {
+        return t.type(
+            "",
+            Object.fromEntries(Object.entries(value).map(([key, item]) => [JSON.stringify(key), literalType(item)]))
+        ).type;
+    }
 
-        return theType;
-    };
+    if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") return value;
+    return t.reference("null");
+};
 
-export const getTypescriptFromOpenApi = ({
+export const getTypescriptFromOpenApi = (args: Omit<TsConversionArgs, "schema"> & { schema: SchemaInput }) => {
+    if (args.schema == null) throw new Error("Schema is required");
+    return emitTypescript({ ...args, schema: normalizeBooleanSchema(args.schema) });
+};
+
+const emitTypescript = ({
     schema,
     meta: inheritedMeta,
     ctx,
@@ -57,7 +83,10 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
     const meta = {} as TsConversionArgs["meta"];
     const isInline = !inheritedMeta?.name;
 
-    const doWrapReadOnly = wrapReadOnly(options);
+    const builtinType = (name: "Array" | "File" | "Readonly" | "Record" | "Exclude", args?: TypeDefinition[]) =>
+        t.reference(ctx?.resolver.resolveSchemaName(name) ? `globalThis.${name}` : name, args);
+    const doWrapReadOnly = (theType: MaybeWrapReadOnlyType) =>
+        options?.allReadonly ? builtinType("Readonly", [theType]) : theType;
 
     if (ctx?.visitedsRefs && inheritedMeta?.$ref) {
         ctx.rootRef = inheritedMeta.$ref;
@@ -70,11 +99,71 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
     let canBeWrapped = !isInline;
     const getTs = (): ts.Node | TypeDefinitionObject | string => {
+        const branchType = (branch: SchemaObject | ReferenceObject) => {
+            const operand = applicableStructuralOperand(branch);
+            const value = emitTypescript({ schema: operand, ctx, meta, options }) as TypeDefinition;
+            // The public output alias already includes each scalar's nullable flag. The input of
+            // a referenced base validator can be narrower, so keep the branch wrapper on input.
+            return needsCompositionBranchNull(operand, ctx?.resolver) && (!("type" in branch) || ctx?.input)
+                ? t.union([value, t.reference("null")])
+                : value;
+        };
+
+        const withoutNull = (value: TypeDefinition) =>
+            t.intersection([value, t.union([ts.factory.createTypeLiteralNode([]), t.undefined()])]);
+        const negated = schemaNegation(schema, ctx?.resolver);
+        if (negated) {
+            const value = branchType(negated.positive);
+            return negated.excludesNull ? withoutNull(value) : (value as ts.TypeNode);
+        }
+
+        const parts = schemaAssertionParts(schema, ctx?.resolver);
+        if (parts) {
+            return t.intersection(
+                intersectionOperands(parts, ctx?.resolver).map((part, index) => {
+                    if (
+                        index > 0 &&
+                        (hasStructuralLiteral(part) || (isReferenceObject(schema) && hasStructuralKeywords(part))) &&
+                        ctx
+                    ) {
+                        ctx.hasDistinctInput = true;
+                        if (!ctx.input) return t.unknown();
+                    }
+
+                    if (
+                        index > 0 &&
+                        (part.type === "object" || (Array.isArray(part.type) && part.type.includes("object"))) &&
+                        !part.properties &&
+                        !part.required &&
+                        !part.enum &&
+                        !Object.hasOwn(part, "const") &&
+                        !part.additionalProperties
+                    ) {
+                        const types = (Array.isArray(part.type) ? part.type : [part.type]).map((kind) =>
+                            kind === "object"
+                                ? builtinType("Record", [t.string(), t.unknown()])
+                                : branchType({ ...part, type: kind })
+                        );
+                        if (part.nullable && acceptsNull(part, ctx?.resolver)) types.push(t.reference("null"));
+                        return t.union(types);
+                    }
+
+                    return branchType(part);
+                })
+            );
+        }
+
         if (isReferenceObject(schema)) {
             if (!ctx?.visitedsRefs || !ctx?.resolver) throw new Error("Context is required for OpenAPI $ref");
 
             let result = ctx.nodeByRef[schema.$ref];
             let schemaName = ctx.resolver.resolveRef(schema.$ref)?.normalized;
+            if (ctx.input) {
+                return t.reference("z.input", [
+                    ts.factory.createTypeQueryNode(ts.factory.createIdentifier(schemaName)),
+                ]);
+            }
+
             if (ctx.visitedsRefs[schema.$ref]) {
                 return t.reference(schemaName);
             }
@@ -86,7 +175,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 }
 
                 ctx.visitedsRefs[schema.$ref] = true;
-                result = getTypescriptFromOpenApi({ schema: actualSchema, meta, ctx, options }) as ts.Node;
+                result = emitTypescript({ schema: actualSchema, meta, ctx, options }) as ts.Node;
             }
 
             if (!schemaName) {
@@ -96,9 +185,16 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
             return t.reference(schemaName);
         }
 
+        const literal = normalizeLiteralAssertion(schema, ctx?.resolver);
+        if (literal) return emitTypescript({ schema: literal, ctx, meta, options });
+
+        if (!schema.type && schema.enum) {
+            return schema.enum.length > 0 ? t.union(schema.enum.map(literalType)) : t.never();
+        }
+
         if (Array.isArray(schema.type)) {
             if (schema.type.length === 1) {
-                return getTypescriptFromOpenApi({
+                return emitTypescript({
                     schema: { ...schema, type: schema.type[0]! },
                     ctx,
                     meta,
@@ -108,7 +204,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
             const types = schema.type.map(
                 (prop) =>
-                    getTypescriptFromOpenApi({
+                    emitTypescript({
                         schema: { ...schema, type: prop },
                         ctx,
                         meta,
@@ -120,79 +216,61 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         }
 
         if (schema.type === "null") {
-            return t.reference("null");
+            return schema.enum && !schema.enum.includes(null) ? t.never() : t.reference("null");
+        }
+
+        const composition = schema.oneOf ?? schema.anyOf ?? schema.allOf;
+        const compositionType = (type: TypeDefinition, unionMembers: TypeDefinition[] = [type]): ts.TypeNode => {
+            if (oneOfNullGuard(schema, ctx?.resolver) === "exclude") {
+                return withoutNull(type);
+            }
+
+            return needsNullableChain(schema) ? t.union([...unionMembers, t.reference("null")]) : (type as ts.TypeNode);
+        };
+
+        if (composition?.length === 1) {
+            const type = branchType(composition[0]!);
+            return compositionType(type);
         }
 
         if (schema.oneOf) {
-            if (schema.oneOf.length === 1) {
-                return getTypescriptFromOpenApi({ schema: schema.oneOf[0]!, ctx, meta, options });
-            }
+            const types = schema.oneOf.map(branchType);
 
-            const types = schema.oneOf.map(
-                (prop) => getTypescriptFromOpenApi({ schema: prop, ctx, meta, options }) as TypeDefinition
-            );
-
-            return schema.nullable ? t.union([...types, t.reference("null")]) : t.union(types);
+            return compositionType(t.union(types), types);
         }
 
         // anyOf accepts a value matching at least one branch; it does not imply an array.
         if (schema.anyOf) {
-            if (schema.anyOf.length === 1) {
-                return getTypescriptFromOpenApi({ schema: schema.anyOf[0]!, ctx, meta, options });
-            }
+            const oneOf = t.union(schema.anyOf.map(branchType));
 
-            const oneOf = t.union(
-                schema.anyOf.map(
-                    (prop) => getTypescriptFromOpenApi({ schema: prop, ctx, meta, options }) as TypeDefinition
-                )
-            );
-
-            return schema.nullable ? t.union([oneOf, t.reference("null")]) : oneOf;
+            return compositionType(oneOf);
         }
 
         if (schema.allOf) {
-            if (schema.allOf.length === 1) {
-                return getTypescriptFromOpenApi({ schema: schema.allOf[0]!, ctx, meta, options });
-            }
-
-            const { patchRequiredSchemaInLoop, noRequiredOnlyAllof, composedRequiredSchema } =
-                inferRequiredSchema(schema);
-
-            const types = noRequiredOnlyAllof.map((prop) => {
-                const type = getTypescriptFromOpenApi({ schema: prop, ctx, meta, options }) as TypeDefinition;
-                if (ctx?.resolver) patchRequiredSchemaInLoop(prop, ctx.resolver);
-                return type;
-            });
-
-            if (Object.keys(composedRequiredSchema.properties).length > 0) {
-                types.push(
-                    getTypescriptFromOpenApi({
-                        schema: composedRequiredSchema,
-                        ctx,
-                        meta,
-                        options,
-                    }) as TypeDefinition
-                );
-            }
-
-            return schema.nullable ? t.union([t.intersection(types), t.reference("null")]) : t.intersection(types);
+            return compositionType(
+                schema.allOf.length > 0
+                    ? t.intersection(intersectionOperands(schema.allOf, ctx?.resolver).map(branchType))
+                    : t.unknown()
+            );
         }
 
         const schemaType = schema.type ? (schema.type.toLowerCase() as NonNullable<typeof schema.type>) : undefined;
         if (schemaType && isPrimitiveType(schemaType)) {
             if (schema.enum) {
-                const primitiveType = schemaType === "integer" ? "number" : schemaType;
                 const hasNull = schema.enum.includes(null);
-                const withoutNull = schema.enum.filter((value) => typeof value === primitiveType);
-                return schema.nullable || hasNull
+                const withoutNull = primitiveEnumValues(schema.enum, schemaType);
+                return hasNull
                     ? t.union([...withoutNull, t.reference("null")])
                     : withoutNull.length > 0
                     ? t.union(withoutNull)
                     : t.never();
             }
 
-            if (schemaType === "string")
-                return schema.nullable ? t.union([t.string(), t.reference("null")]) : t.string();
+            if (schemaType === "string") {
+                const type = schema.format === "binary" ? builtinType("File") : t.string();
+                return schema.nullable ? t.union([type, t.reference("null")]) : type;
+            }
+
             if (schemaType === "boolean")
                 return schema.nullable ? t.union([t.boolean(), t.reference("null")]) : t.boolean();
             if (schemaType === "number" || schemaType === "integer")
@@ -200,8 +278,9 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         }
 
         if (schemaType === "array") {
+            let arrayOfType: TypeDefinition = t.any();
             if (schema.items) {
-                let arrayOfType = getTypescriptFromOpenApi({
+                arrayOfType = emitTypescript({
                     schema: schema.items,
                     ctx,
                     meta,
@@ -212,61 +291,47 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                     arrayOfType = t.reference(arrayOfType);
                 }
 
-                return schema.nullable
-                    ? t.union([doWrapReadOnly(t.array(arrayOfType)), t.reference("null")])
-                    : doWrapReadOnly(t.array(arrayOfType));
+                // The array applies presence and default modifiers from the item, including siblings of an item $ref.
+                if (
+                    ctx?.resolver.supportsSchemaRefSiblings &&
+                    isReferenceObject(schema.items) &&
+                    "nullable" in schema.items &&
+                    schema.items.nullable
+                ) {
+                    arrayOfType = t.union([arrayOfType, t.reference("null")]);
+                }
+
+                if (
+                    ctx &&
+                    options?.withDefaultValues !== false &&
+                    useSiteDefault(schema.items, ctx.resolver, "arrayItem", !!options?.schemaRefiner)
+                ) {
+                    ctx.hasDistinctInput = true;
+                    if (ctx.input) arrayOfType = t.union([arrayOfType, t.undefined()]);
+                }
             }
 
-            return schema.nullable
-                ? t.union([doWrapReadOnly(t.array(t.any())), t.reference("null")])
-                : doWrapReadOnly(t.array(t.any()));
+            const array = doWrapReadOnly(builtinType("Array", [arrayOfType]));
+            return schema.nullable ? t.union([array, t.reference("null")]) : array;
         }
 
         if (schemaType === "object" || schema.properties || schema.additionalProperties) {
-            if (!schema.properties) {
-                return ts.factory.createTypeLiteralNode([]);
+            const isNullable = schema.nullable && schema.enum?.includes(null) !== false;
+            const requiredKeys = requiredAdditionalKeys(schema);
+            if (hasImpossibleRequiredKey(schema, requiredKeys)) {
+                return isNullable ? t.reference("null") : t.never();
+            }
+
+            if (!schema.properties && !schema.additionalProperties && requiredKeys.length === 0) {
+                const empty = ts.factory.createTypeLiteralNode([]);
+                return isNullable ? t.union([empty, t.reference("null")]) : empty;
             }
 
             canBeWrapped = false;
 
-            let additionalProperties;
-            if (schema.additionalProperties) {
-                let additionalPropertiesType;
-                if (
-                    (typeof schema.additionalProperties === "boolean" && schema.additionalProperties) ||
-                    (typeof schema.additionalProperties === "object" &&
-                        Object.keys(schema.additionalProperties).length === 0)
-                ) {
-                    additionalPropertiesType = t.any();
-                } else if (typeof schema.additionalProperties === "object") {
-                    additionalPropertiesType = getTypescriptFromOpenApi({
-                        schema: schema.additionalProperties,
-                        ctx,
-                        meta,
-                        options,
-                    });
-                }
-
-                additionalProperties = ts.factory.createTypeLiteralNode([
-                    ts.factory.createIndexSignature(
-                        undefined,
-                        [
-                            ts.factory.createParameterDeclaration(
-                                undefined,
-                                undefined,
-                                ts.factory.createIdentifier("key"),
-                                undefined,
-                                ts.factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)
-                            ),
-                        ],
-                        additionalPropertiesType as ts.TypeNode
-                    ),
-                ]);
-            }
-
             const props = Object.fromEntries(
-                Object.entries(schema.properties).map(([prop, propSchema]) => {
-                    let propType = getTypescriptFromOpenApi({
+                Object.entries(schema.properties ?? {}).map(([prop, propSchema]) => {
+                    let propType = emitTypescript({
                         schema: propSchema,
                         ctx,
                         meta,
@@ -277,8 +342,22 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                         propType = t.reference(propType);
                     }
 
+                    // Reference declarations hold the base validator. Properties apply the target's nullable chain.
+                    if (
+                        ctx?.input &&
+                        isReferenceObject(propSchema) &&
+                        needsCompositionBranchNull(propSchema, ctx.resolver)
+                    ) {
+                        propType = t.union([propType, t.reference("null")]);
+                    }
+
                     const isRequired = schema.required?.includes(prop);
-                    if (!isRequired) {
+                    const hasDefault =
+                        options?.withDefaultValues !== false &&
+                        useSiteDefault(propSchema, ctx?.resolver, undefined, !!options?.schemaRefiner);
+                    if (ctx && isRequired && hasDefault) ctx.hasDistinctInput = true;
+
+                    if (!isRequired || (ctx?.input && hasDefault)) {
                         const optional = t.optional(propType);
                         if (options?.withDocs) {
                             // Tanu transfers outer comments to the property. The union factory
@@ -294,10 +373,75 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 })
             );
 
-            const objectType = additionalProperties ? t.intersection([props, additionalProperties]) : props;
+            let additionalProperties;
+            let additionalPropertiesType: ts.TypeNode | undefined;
+            if (schema.additionalProperties) {
+                const value = schema.additionalProperties;
+                let valueType =
+                    typeof value === "object" && Object.keys(value).length > 0
+                        ? (emitTypescript({ schema: value, ctx, options }) as ts.TypeNode)
+                        : t.unknown();
+                if (ctx?.input && isReferenceObject(value) && needsCompositionBranchNull(value, ctx.resolver)) {
+                    valueType = t.union([valueType, t.reference("null")]);
+                }
+
+                additionalPropertiesType = valueType;
+                let indexValue = valueType;
+                if (
+                    ctx &&
+                    options?.withDefaultValues !== false &&
+                    typeof value === "object" &&
+                    useSiteDefault(value, ctx.resolver, "dictionaryEntry", !!options?.schemaRefiner)
+                ) {
+                    // Extra entries may be supplied as undefined and then defaulted. A required key still needs a value.
+                    ctx.hasDistinctInput = true;
+                    if (ctx.input) indexValue = t.union([indexValue, t.undefined()]);
+                }
+
+                // A string index also covers the explicitly declared keys, whose schemas take precedence at runtime.
+                const namedValues = Object.values(props);
+                if (namedValues.length > 0 && indexValue.kind !== ts.SyntaxKind.UnknownKeyword) {
+                    indexValue = t.union([indexValue, ...namedValues]);
+                }
+
+                additionalProperties = ts.factory.createTypeLiteralNode([
+                    ts.factory.createIndexSignature(
+                        undefined,
+                        [
+                            ts.factory.createParameterDeclaration(
+                                undefined,
+                                undefined,
+                                ts.factory.createIdentifier("key"),
+                                undefined,
+                                ts.factory.createKeywordTypeNode(ts.SyntaxKind.StringKeyword)
+                            ),
+                        ],
+                        indexValue
+                    ),
+                ]);
+            }
+
+            for (const key of requiredKeys) {
+                // Intersect with the sibling's value type while excluding undefined from optional properties.
+                const present = t.union([ts.factory.createTypeLiteralNode([]), t.reference("null")]);
+                props[JSON.stringify(key)] =
+                    additionalPropertiesType && additionalPropertiesType.kind !== ts.SyntaxKind.UnknownKeyword
+                        ? t.intersection([additionalPropertiesType, present])
+                        : present;
+            }
+
+            // Readonly around an intersection causes a circular alias for recursive dictionaries.
+            const objectType = additionalProperties
+                ? Object.keys(props).length > 0
+                    ? t.intersection([doWrapReadOnly(props), doWrapReadOnly(additionalProperties)])
+                    : doWrapReadOnly(additionalProperties)
+                : doWrapReadOnly(props);
 
             // Materialize inline objects as TypeNodes too, including index-signature values.
-            const declaration = t.type(inheritedMeta?.name ?? "", doWrapReadOnly(objectType));
+            const declaration = t.type(
+                inheritedMeta?.name ?? "",
+                isNullable ? t.union([objectType, t.reference("null")]) : objectType
+            );
             return isInline ? declaration.type : declaration;
         }
 

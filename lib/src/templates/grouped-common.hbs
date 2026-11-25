@@ -7,5 +7,5 @@ export {{{this}}}
 {{/if}}
 
 {{#each schemas}}
-export const {{@key}} = {{{this}}};
+export const {{@key}}{{#if (lookup ../emittedType @key)}}: z.ZodType<{{@key}}{{#with (lookup ../inputType @key)}}, z.ZodTypeDef, {{this}}{{/with}}>{{/if}} = {{{this}}};
 {{/each}}

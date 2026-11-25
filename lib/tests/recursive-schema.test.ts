@@ -79,6 +79,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -208,6 +209,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -247,6 +249,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -272,6 +275,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -328,6 +332,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -406,6 +411,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
@@ -603,6 +609,7 @@ describe("recursive-schema", () => {
                   "getSchemaByRef": [Function],
                   "resolveRef": [Function],
                   "resolveSchemaName": [Function],
+                  "supportsSchemaRefSiblings": false,
               },
               "schemaByName": {},
               "zodSchemaByName": {
