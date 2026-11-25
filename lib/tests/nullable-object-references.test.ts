@@ -654,3 +654,70 @@ test("converts boolean schemas supplied directly through the generator API", () 
     expect(getZodSchema({ schema: true }).toString()).toBe("z.unknown()");
     expect(getZodSchema({ schema: { type: "array", items: false } }).toString()).toBe("z.array(z.never())");
 });
+
+test.each([false, true])(
+    "keeps finite structural literals precise through a reference (readonly %s)",
+    async (allReadonly) => {
+        const fixed: SchemaObject = { required: ["flag"], const: { flag: true } };
+        const schemas: Record<string, SchemaObject> = {
+            Fixed: fixed,
+            Dictionary: { additionalProperties: { type: "integer" }, enum: [{ id: 1 }] },
+            InvalidMember: { additionalProperties: { type: "integer" }, const: { id: "invalid" } },
+            Changed: {
+                properties: { id: { type: "integer" }, label: { type: "string", default: "new" } },
+                required: ["id", "label"],
+                additionalProperties: false,
+                enum: [{ id: 1, extra: 4 }, "keep"],
+            },
+            ChangedRows: {
+                items: {
+                    type: "object",
+                    properties: { id: { type: "integer" } },
+                    required: ["id"],
+                    additionalProperties: false,
+                },
+                enum: [[{ id: 1, extra: 4 }], true],
+            },
+            Disjoint: { required: ["id"], enum: [{ id: true }], const: { id: false } },
+            FixedAlias: ref("Fixed"),
+            Inline: { anyOf: [fixed, { type: "integer" }] },
+            ViaAlias: { anyOf: [ref("FixedAlias"), { type: "integer" }] },
+        };
+        const source = await generateZodClientFromOpenAPI({
+            openApiDoc: {
+                openapi: "3.1.0",
+                info: { title: "Finite structural values", version: "1" },
+                paths: {},
+                components: { schemas },
+            },
+            disableWriteToFile: true,
+            options: { shouldExportAllSchemas: true, shouldExportAllTypes: true, allReadonly },
+        });
+        const validators = loadSchemas(source).schemas;
+        for (const name of ["FixedAlias", "Inline", "ViaAlias"]) {
+            expect(validators[name]!.parse({ flag: true })).toEqual({ flag: true });
+            for (const invalid of [true, { flag: false }, { flag: true, other: 1 }]) {
+                expect(validators[name]!.safeParse(invalid).success).toBe(false);
+            }
+        }
+        expect(validators.Dictionary!.parse({ id: 1 })).toEqual({ id: 1 });
+        expect(validators.InvalidMember!.safeParse({ id: "invalid" }).success).toBe(false);
+        expect(validators.Disjoint!.safeParse({ id: false }).success).toBe(false);
+        expect(validators.Changed!.parse({ id: 1, extra: 4 })).toEqual({ id: 1, label: "new" });
+        expect(validators.Changed!.parse("keep")).toBe("keep");
+        const rows = validators.ChangedRows!.parse([{ id: 1, extra: 4 }]);
+        expect(rows).toEqual([{ id: 1 }]);
+        expect(Object.isFrozen(rows)).toBe(allReadonly);
+        expect(
+            typeErrors(`${source}
+const fixed: { flag: true } = FixedAlias.parse({});
+const dictionary: { id: 1 } = Dictionary.parse({});
+const mixed: { id: number; label: string } | "keep" = Changed.parse({});
+const rows: ReadonlyArray<{ id: number }> | true = ChangedRows.parse({});
+const valid: z.input<typeof Changed> = { id: 1, extra: 4 };
+// @ts-expect-error Only the enum object or its string alternative is valid input.
+const wrong: z.input<typeof Changed> = { id: 2, extra: 4 };
+`)
+        ).toEqual([]);
+    }
+);

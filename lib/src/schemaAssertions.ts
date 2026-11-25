@@ -2,7 +2,9 @@ import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 
 import { isReferenceObject } from "./isReferenceObject";
 import type { DocumentResolver } from "./makeSchemaResolver";
-import { acceptsScalarBounds } from "./scalarBounds";
+import { normalizeBooleanSchema } from "./normalizeBooleanSchema";
+import { acceptsScalarBounds, hasLegacyPatternDelimiters } from "./scalarBounds";
+import type { TemplateContext } from "./template-context";
 import { isPrimitiveType } from "./utils";
 
 export const hasNullableObjectType = (schema: SchemaObject | ReferenceObject) => {
@@ -76,6 +78,73 @@ const scalarAssertionKeys = [
 ];
 const exactNegationKeys = new Set([...scalarAssertionKeys, "multipleOf", "minItems", "maxItems"]);
 
+type ConditionalResolver = Pick<DocumentResolver, "supportsSchemaRefSiblings" | "getSchemaByRef">;
+const conditionalKinds = ["object", "array", "string", "boolean", "null", "integer", "number"] as const;
+type ConditionalKind = typeof conditionalKinds[number];
+
+function matchingConditionalKinds(
+    test: Schema | boolean,
+    resolver: ConditionalResolver
+): ConditionalKind[] | undefined {
+    if (typeof test === "boolean") return test ? [...conditionalKinds] : [];
+    const layers = getConjunctiveSchemaLayers(normalizeBooleanSchema(test), resolver, true);
+    if (!layers) return;
+    if (layers.some((layer) => layer.enum?.length === 0)) return [];
+    if (
+        !layers.every((layer) =>
+            Object.keys(layer).every(
+                (key) => key === "type" || key === "nullable" || nonAssertionKeys.has(key) || key.startsWith("x-")
+            )
+        )
+    )
+        return;
+    return conditionalKinds.filter((kind) =>
+        layers.every((layer) => {
+            const types = Array.isArray(layer.type) ? layer.type : layer.type ? [layer.type] : [];
+            return (
+                types.length === 0 ||
+                types.includes(kind) ||
+                (kind === "integer" && types.includes("number")) ||
+                (kind === "null" && layer.nullable)
+            );
+        })
+    );
+}
+
+// Split a structural schema on a pure JSON-type condition. During the split, "number"
+// denotes the noninteger half of the numeric domain. Recombine both halves when possible.
+export function lowerStructuralConditional(schema: Schema, resolver?: ConditionalResolver) {
+    if (!resolver?.supportsSchemaRefSiblings || !Object.hasOwn(schema, "if")) return;
+    const { if: test, then, else: otherwise, ...base }: SchemaAssertions = { ...schema };
+    if (test === undefined || base.type) return;
+    if (
+        !hasStructuralKeywords(base) &&
+        !getConjunctiveSchemaLayers(base, resolver)?.some((layer) => !layer.type && hasStructuralKeywords(layer))
+    )
+        return;
+    if ((then === undefined || then === true) && (otherwise === undefined || otherwise === true))
+        return { base, allowed: {} };
+    const yes = matchingConditionalKinds(test, resolver);
+    if (!yes) return;
+    const option = (kinds: ConditionalKind[], rule: Schema | boolean | undefined): SchemaObject[] => {
+        if (rule === false || kinds.length === 0) return [];
+        const types = kinds.filter((kind) => kind !== "integer" || !kinds.includes("number"));
+        const typed: SchemaObject = { type: types.length === 1 ? types[0]! : types };
+        if (kinds.includes("number") && !kinds.includes("integer")) typed.not = { type: "integer" };
+        if (rule && typeof rule === "object") typed.allOf = [normalizeBooleanSchema(rule)];
+        return [typed];
+    };
+
+    const branches = [
+        ...option(yes, then),
+        ...option(
+            conditionalKinds.filter((kind) => !yes.includes(kind)),
+            otherwise
+        ),
+    ];
+    return { base, allowed: branches.length > 1 ? { anyOf: branches } : branches[0] ?? { enum: [] } };
+}
+
 const everyMatch = (matches: NullMatch[]): NullMatch =>
     matches.includes(false) ? false : matches.includes("unknown") ? "unknown" : true;
 
@@ -88,7 +157,7 @@ const exactlyOneMatch = (matches: NullMatch[]): NullMatch => {
 // Only the selected branch constrains null. A branch without a schema imposes no restriction.
 function conditionalNullMatch(schema: SchemaAssertions, visit: (branch: Schema) => NullMatch): NullMatch {
     const match = (branch: Schema | boolean | undefined): NullMatch =>
-        typeof branch === "boolean" ? branch : branch ? visit(branch) : true;
+        typeof branch === "boolean" ? branch : branch ? visit(normalizeBooleanSchema(branch)) : true;
     const condition = match(schema.if);
     if (condition !== "unknown") return match(condition ? schema.then : schema.else);
     const yes = match(schema.then);
@@ -152,6 +221,199 @@ export function oneOfNullGuard(schema: SchemaObject, resolver?: DocumentResolver
     return !isExact && matches.includes(true) ? "exclude" : undefined;
 }
 
+const scalarKinds = ["boolean", "number", "string"] as const;
+const nonObjectKinds = ["array", ...scalarKinds] as const;
+type NonObjectKind = typeof nonObjectKinds[number];
+const keywordDomains = new Map(
+    Object.entries({
+        object: [
+            "properties",
+            "additionalProperties",
+            "required",
+            "patternProperties",
+            "minProperties",
+            "maxProperties",
+            "propertyNames",
+            "dependentSchemas",
+            "dependentRequired",
+            "unevaluatedProperties",
+        ],
+        array: [
+            "items",
+            "minItems",
+            "maxItems",
+            "uniqueItems",
+            "prefixItems",
+            "contains",
+            "minContains",
+            "maxContains",
+            "unevaluatedItems",
+        ],
+        number: ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"],
+        string: ["minLength", "maxLength", "pattern"],
+    }).flatMap(([kind, keys]) => keys.map((key) => [key, kind] as const))
+);
+
+// A reference and its siblings are a conjunction in 3.1. A composition with one option
+// also asserts that option, irrespective of the composition keyword.
+function getConjunctiveSchemaLayers(
+    schema: Schema,
+    resolver: ConditionalResolver,
+    flattenAllOf = false
+): SchemaObject[] | undefined {
+    const layers: SchemaObject[] = [];
+    const active = new Set<string>();
+    const visit = (branch: Schema): boolean => {
+        const { $ref, ...siblings }: SchemaAssertions = { ...branch };
+        const applicable: SchemaObject = $ref && !resolver.supportsSchemaRefSiblings ? {} : siblings;
+        const { oneOf, anyOf, allOf, ...assertions } = applicable;
+        const local: SchemaObject = assertions;
+        const compositions = { allOf, anyOf, oneOf };
+        const children: Schema[] = [];
+        for (const key of ["allOf", "anyOf", "oneOf"] as const) {
+            const options = compositions[key];
+            if (!options) continue;
+            if (options.length === 1 || (key === "allOf" && flattenAllOf)) children.push(...options);
+            else local[key] = options;
+        }
+
+        layers.push(local);
+        if ($ref) {
+            if (active.has($ref)) return false;
+            active.add($ref);
+            const target = resolver.getSchemaByRef($ref);
+            if (!target || !visit(target)) return false;
+            active.delete($ref);
+        }
+
+        return children.every(visit);
+    };
+
+    return visit(schema) ? layers : undefined;
+}
+
+function canCheckArrayItems(items: Schema | undefined, resolver: DocumentResolver) {
+    const layers = items && getConjunctiveSchemaLayers(items, resolver);
+    return layers?.every((schema) =>
+        Object.keys(schema).every((key) => nonAssertionKeys.has(key) || canProveKeyword(schema, key))
+    );
+}
+
+function canProveKeyword(schema: SchemaObject, key: string) {
+    return (
+        exactNegationKeys.has(key) ||
+        (key === "pattern" && schema.pattern !== undefined && !hasLegacyPatternDelimiters(schema.pattern))
+    );
+}
+
+// "check" means a successful raw parse proves a match. "never" also guarantees the
+// parser rejects the input, so that option cannot falsely make a containing union succeed.
+type KindMatch = "always" | "never" | "check" | "unknown";
+
+function localKindMatch(local: SchemaObject, kind: NonObjectKind, resolver: DocumentResolver): KindMatch {
+    const types = Array.isArray(local.type) ? local.type : local.type ? [local.type] : [];
+    const isRestricted = types.length > 0 && !types.includes(kind);
+    if (isRestricted && (kind !== "number" || !types.includes("integer"))) return "never";
+    const keys = Object.keys(local).filter((key) => {
+        const domain = keywordDomains.get(key);
+        return (
+            (!domain || domain === kind) &&
+            key !== "type" &&
+            key !== "nullable" &&
+            !nonAssertionKeys.has(key) &&
+            !key.startsWith("x-")
+        );
+    });
+    if (
+        keys.some((key) =>
+            key === "items" ? !canCheckArrayItems(local.items, resolver) : !canProveKeyword(local, key)
+        )
+    )
+        return "unknown";
+    return isRestricted || keys.length > 0 ? "check" : "always";
+}
+
+function conjunctionMatch(matches: KindMatch[]): KindMatch {
+    if (matches.includes("never")) return "never";
+    if (matches.includes("unknown")) return "unknown";
+    return matches.includes("check") ? "check" : "always";
+}
+
+function alternativeMatch(matches: KindMatch[], exclusive: boolean): KindMatch {
+    const possible = matches.filter((match) => match !== "never");
+    if (possible.length < 2) return possible[0] ?? "never";
+    // A generated oneOf may use an ordinary union. Its successful parse cannot prove
+    // exclusivity when two of its children can match this kind.
+    if (exclusive) return "unknown";
+    if (possible.includes("always")) return "always";
+    return possible.includes("unknown") ? "unknown" : "check";
+}
+
+function nonObjectMatch(branch: Schema, kind: NonObjectKind, resolver: DocumentResolver) {
+    const refs = new Map<string, KindMatch>();
+    let hasStructural = false;
+    const visit = (schema: Schema): KindMatch => {
+        const conditional = lowerStructuralConditional(schema, resolver);
+        if (conditional) {
+            hasStructural = true;
+            return conjunctionMatch([visit(conditional.base), visit(conditional.allowed)]);
+        }
+
+        const { $ref, oneOf, anyOf, allOf, not, ...local }: SchemaAssertions = { ...schema };
+        hasStructural ||= !local.type && hasStructuralKeywords(local);
+        const matches = [localKindMatch(local, kind, resolver)];
+        if (not) {
+            // A pure type negation is exact. The fractional side of an integer condition uses it.
+            const excluded =
+                !isReferenceObject(not) && not.type && Object.keys(not).length === 1
+                    ? localKindMatch(not, kind, resolver)
+                    : "unknown";
+            matches.push(excluded === "always" ? "never" : excluded === "never" ? "always" : excluded);
+        }
+
+        if ($ref) {
+            if (!refs.has($ref)) {
+                // A recursive re-entry has no independent proof.
+                refs.set($ref, "unknown");
+                const target = resolver.getSchemaByRef($ref);
+                if (target) refs.set($ref, visit(target));
+            }
+
+            matches.push(refs.get($ref)!);
+        }
+
+        if (allOf) matches.push(...allOf.map(visit));
+        if (anyOf) matches.push(alternativeMatch(anyOf.map(visit), false));
+        if (oneOf) matches.push(alternativeMatch(oneOf.map(visit), true));
+        return conjunctionMatch(matches);
+    };
+
+    const match = visit(branch);
+    return { match, hasStructural };
+}
+
+// Untyped structural options also match values outside the domain of their keywords.
+// Keep the ordinary union on object inputs (its parsing policy includes defaults and stripping).
+export function structuralOneOfOverlaps(branches: Schema[], resolver?: DocumentResolver) {
+    if (!resolver?.supportsSchemaRefSiblings) return [];
+    return nonObjectKinds.flatMap((kind) => {
+        const matches = branches.map((branch) => nonObjectMatch(branch, kind, resolver));
+        if (!matches.some(({ hasStructural, match }) => hasStructural && (match === "always" || match === "check")))
+            return [];
+        const always = matches.filter(({ match }) => match === "always").length;
+        const checks = matches.flatMap(({ match }, i) => (match === "check" ? [i] : []));
+        return always + checks.length >= 2 ? [{ kind, always, checks }] : [];
+    });
+}
+
+// An intersection with the remaining kinds can contain a recursive alias. A conditional
+// Exclude around the recursive union would be a circular TypeScript type definition.
+export function structuralOneOfDomain(overlaps: ReturnType<typeof structuralOneOfOverlaps>) {
+    const excluded = new Set(overlaps.filter(({ always }) => always > 1).map(({ kind }) => kind));
+    if (excluded.size === 0) return;
+    return { allowsArrays: !excluded.has("array"), scalars: scalarKinds.filter((kind) => !excluded.has(kind)) };
+}
+
 export function schemaNegation(schema: Schema, resolver?: DocumentResolver) {
     const local: SchemaAssertions = { ...schema };
     if (
@@ -205,6 +467,47 @@ export const hasStructuralLiteral = (schema: SchemaAssertions) =>
     (Object.hasOwn(schema, "const") ? [schema.const] : schema.enum ?? []).some(
         (value) => value !== null && typeof value === "object"
     );
+
+// Finite JSON values select their own applicable structural rules. A parser can still add
+// defaults or strip fields, so keep the exact literal output only when its shape is preserved.
+export function finiteStructuralAlternatives(
+    schema: Schema,
+    resolver?: DocumentResolver,
+    options?: TemplateContext["options"]
+) {
+    if (!resolver?.supportsSchemaRefSiblings || isReferenceObject(schema) || !isUntypedStructural(schema)) return;
+    const hasConst = Object.hasOwn(schema, "const");
+    if (!hasConst && !schema.enum) return;
+    const { const: constant, enum: members, ...base }: SchemaAssertions = schema;
+    const values = (members ?? [constant]).filter((value) => !hasConst || sameLiteral(value, constant));
+    const kinds = ["object", "array", "string", "number", "boolean", "null"] as const;
+    return kinds.flatMap((type) => {
+        const literals = values.filter(
+            (value) => (value === null ? "null" : Array.isArray(value) ? "array" : typeof value) === type
+        );
+        if (literals.length === 0) return [];
+        const canPreserveLiteral =
+            !options?.schemaRefiner &&
+            literals.every((value) =>
+                preservesLiteral(base, value, options?.additionalPropertiesDefaultValue !== false)
+            );
+        return [{ base: { ...base, type, nullable: false }, literal: { enum: literals }, canPreserveLiteral }];
+    });
+}
+
+function preservesLiteral(schema: Schema | undefined, value: unknown, additionalDefault: boolean): boolean {
+    if (!schema || value === null || typeof value !== "object") return true;
+    if (isReferenceObject(schema) || schema.oneOf || schema.anyOf || schema.allOf || schema.not) return false;
+    if (Array.isArray(value)) return value.every((item) => preservesLiteral(schema.items, item, additionalDefault));
+    const properties = schema.properties ?? {};
+    // An absent declared property may acquire a default, including through a reference.
+    if (Object.keys(properties).some((key) => !Object.hasOwn(value, key))) return false;
+    const additional = schema.additionalProperties ?? additionalDefault;
+    return Object.entries(value).every(([key, item]) => {
+        if (Object.hasOwn(properties, key)) return preservesLiteral(properties[key], item, additionalDefault);
+        return typeof additional === "boolean" ? additional : preservesLiteral(additional, item, additionalDefault);
+    });
+}
 
 export const hasUntypedValueChecks = (schema: SchemaObject) =>
     schema.format === "hostname" ||
@@ -282,10 +585,7 @@ export function schemaAssertionParts(schema: Schema, resolver?: DocumentResolver
 }
 
 // openapi3-ts also reads 3.1 documents, although its schema interface omits the const keyword.
-export function normalizeLiteralAssertion(
-    schema: SchemaAssertions,
-    resolver?: DocumentResolver
-): SchemaObject | undefined {
+export function normalizeValueSchema(schema: SchemaAssertions, resolver?: DocumentResolver): SchemaObject | undefined {
     if (Object.hasOwn(schema, "const")) {
         const { const: value, ...rest } = schema;
         return { ...rest, enum: [value] };
@@ -296,7 +596,9 @@ export function normalizeLiteralAssertion(
         if (!types.includes("null")) return { ...schema, enum: schema.enum.filter((value) => value !== null) };
     }
 
-    return undefined;
+    // In 3.1 these keywords have the same domain in a component, property or composition.
+    // A conditional that could not be lowered keeps the existing standalone parser.
+    return resolver?.supportsSchemaRefSiblings && schema.if === undefined ? structuralTypeUnion(schema) : undefined;
 }
 
 export const isUntypedStructural = (schema: Schema): boolean =>
@@ -308,18 +610,60 @@ export const isUntypedStructural = (schema: Schema): boolean =>
     !schema.not &&
     ["properties", "required", "additionalProperties", "items"].some((key) => Object.hasOwn(schema, key));
 
-// In a composition, structural keywords constrain only the applicable JSON instances. An explicit
-// object bound elsewhere in the intersection lets us discard the other alternatives up front.
-export function applicableStructuralOperand(schema: Schema): Schema {
+// Each structural keyword constrains only its applicable JSON type.
+export function structuralTypeUnion(schema: Schema, resolver?: DocumentResolver): SchemaObject | undefined {
+    if (lowerStructuralConditional(schema, resolver)) return;
+    if (resolver?.supportsSchemaRefSiblings && ("enum" in schema || "const" in schema)) return;
     return isUntypedStructural(schema)
         ? { ...schema, type: ["object", "array", "string", "number", "boolean", "null"] }
-        : schema;
+        : undefined;
 }
 
 export function intersectionOperands<T extends Schema>(
     operands: T[],
-    resolver?: DocumentResolver
+    resolver: DocumentResolver | undefined,
+    canDropInapplicable: boolean
 ): Array<T | SchemaObject> {
+    // In explicit allOf, only parsers whose keywords apply can contribute fields to the result.
+    // Merging an identity parser can otherwise restore fields another parser stripped.
+    if (canDropInapplicable && resolver?.supportsSchemaRefSiblings && operands.length > 1) {
+        const layers = operands.map((operand) => getConjunctiveSchemaLayers(operand, resolver));
+        const domains = layers.map((chain) => {
+            if (!chain?.some(hasStructuralKeywords)) return;
+            const keys = chain
+                .flatMap(Object.keys)
+                .filter((key) => !nonAssertionKeys.has(key) && !key.startsWith("x-"));
+            return keys.every((key) => keywordDomains.has(key))
+                ? new Set(keys.map((key) => keywordDomains.get(key)!))
+                : undefined;
+        });
+        const bound = (["array", "object"] as const).find((kind) =>
+            layers.some((chain) =>
+                chain?.some(
+                    ({ type }) =>
+                        type === kind ||
+                        (Array.isArray(type) && type.includes(kind) && type.every((t) => t === kind || t === "null"))
+                )
+            )
+        );
+        if (bound) {
+            operands = operands.filter((_operand, i) => !domains[i] || domains[i]!.has(bound));
+        } else if (domains.every((domain) => domain?.size === 1 && (domain.has("array") || domain.has("object")))) {
+            const objects = operands.filter((_operand, i) => domains[i]!.has("object"));
+            const arrays = operands.filter((_operand, i) => domains[i]!.has("array"));
+            if (objects.length > 0 && arrays.length > 0)
+                return [
+                    {
+                        anyOf: [
+                            { type: "object", allOf: objects },
+                            { type: "array", allOf: arrays },
+                            { type: ["string", "number", "boolean", "null"] },
+                        ],
+                    },
+                ];
+        }
+    }
+
     if (!operands.some(isUntypedStructural)) return operands;
     const bound = operands.find((branch) => {
         const target = getSchemaReferenceChain(branch, resolver).at(-1);

@@ -618,7 +618,7 @@ test("getSchemaAsTsString with readonly", () => {
         '"export type unknownType = unknown;"'
     );
 
-    expect(getSchemaAsTsString({ type: "array", items: { type: "string" } }, undefined, options)).toMatchInlineSnapshot('"Readonly<Array<string>>"');
+    expect(getSchemaAsTsString({ type: "array", items: { type: "string" } }, undefined, options)).toMatchInlineSnapshot(`"ReadonlyArray<string>"`);
     expect(getSchemaAsTsString({ type: "object" }, { name: "EmptyObject" }, options)).toMatchInlineSnapshot(
         '"export type EmptyObject = {};"'
     );
@@ -743,9 +743,9 @@ test("getSchemaAsTsString with readonly", () => {
             },
         }, undefined, options)
     ).toMatchInlineSnapshot(`
-      "Readonly<Array<Readonly<{
+      "ReadonlyArray<Readonly<{
           str?: string | undefined;
-      }>>>"
+      }>>"
     `);
 
     expect(
@@ -758,7 +758,7 @@ test("getSchemaAsTsString with readonly", () => {
                 },
             },
         }, undefined, options)
-    ).toMatchInlineSnapshot('"Readonly<Array<Readonly<Array<string>>>>"');
+    ).toMatchInlineSnapshot(`"ReadonlyArray<ReadonlyArray<string>>"`);
 
     expect(
         getSchemaAsTsString(

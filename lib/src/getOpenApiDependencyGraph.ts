@@ -2,6 +2,7 @@ import type { SchemaObject } from "openapi3-ts";
 
 import { isReferenceObject } from "./isReferenceObject";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
+import { lowerStructuralConditional } from "./schemaAssertions";
 
 export const getOpenApiDependencyGraph = (
     schemaRef: string[],
@@ -11,10 +12,19 @@ export const getOpenApiDependencyGraph = (
     const normalizedSchemas = new WeakMap<object, SchemaObject>();
     const visitedsRefs = {} as Record<string, boolean>;
     const refsDependencyGraph = {} as Record<string, Set<string>>;
+    const resolver = {
+        supportsSchemaRefSiblings,
+        getSchemaByRef: (ref: string) => {
+            const target = getSchemaByRef(ref);
+            return target == null ? target : normalizeBooleanSchema(target, normalizedSchemas);
+        },
+    };
 
     const visit = (input: SchemaInput, fromRef: string): void => {
         if (!input || typeof input === "boolean") return;
-        const schema = normalizeBooleanSchema(input, normalizedSchemas);
+        const normalized = normalizeBooleanSchema(input, normalizedSchemas);
+        const conditional = lowerStructuralConditional(normalized, resolver);
+        const schema = conditional ? { allOf: [conditional.base, conditional.allowed] } : normalized;
 
         if (isReferenceObject(schema)) {
             if (!refsDependencyGraph[fromRef]) {

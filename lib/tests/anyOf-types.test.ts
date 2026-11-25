@@ -128,3 +128,43 @@ ${
 `;
     expect(typeErrors(source)).toEqual([]);
 });
+
+test.each([false, true])("checks recursive structural array alternatives (readonly %s)", (allReadonly) => {
+    const component = { $ref: "#/components/schemas/Value" };
+    const context = getZodClientTemplateContext(
+        {
+            openapi: "3.1.0",
+            info: { title: "Structural arrays", version: "1" },
+            paths: {},
+            components: {
+                schemas: {
+                    Closed: {
+                        properties: { length: { type: "integer" } },
+                        required: ["length"],
+                        additionalProperties: false,
+                        items: { type: "string" },
+                    },
+                    Value: {
+                        properties: { length: { type: "integer" } },
+                        items: { type: "object", required: ["child"], properties: { child: component } },
+                    },
+                },
+            },
+        },
+        { shouldExportAllSchemas: true, allReadonly }
+    );
+    const source = `import { z } from "zod";
+${context.types.Value}
+const Value: z.ZodType<Value> = ${context.schemas.Value};
+const Closed = ${context.schemas.Closed};
+interface Measured { length: number }
+declare const measured: Measured;
+const allowed: z.input<typeof Closed> = measured;
+// @ts-expect-error a numeric length does not make an invalid array a JSON object
+const badClosed: z.output<typeof Closed> = [32];
+const scalar: Value = 1.5;
+const nested: Value = [{ child: [{ child: "end" }] }];
+// @ts-expect-error an array still has to validate its items, even though it has a numeric length
+const invalid: Value = [32];`;
+    expect(typeErrors(source)).toEqual([]);
+});

@@ -6,9 +6,11 @@ import { escapeControlCharacters } from "./utils";
 type StringRule = ["regex", RegExp] | ["min" | "max", number];
 type NumericBound = ["gt" | "gte" | "lt" | "lte", number];
 
+export const hasLegacyPatternDelimiters = (pattern: string) => pattern.startsWith("/^") && pattern.endsWith("$/");
+
 function schemaPattern(pattern: string) {
     // Preserve the legacy /^...$/ spelling. Other slashes are part of the pattern.
-    if (pattern.startsWith("/^") && pattern.endsWith("$/")) pattern = pattern.slice(1, -1);
+    if (hasLegacyPatternDelimiters(pattern)) pattern = pattern.slice(1, -1);
     try {
         return new RegExp(pattern, "u");
     } catch {

@@ -396,3 +396,38 @@ it.each([false, true])(
         expect(schema.safeParse({ id: 0 }).success).toBe(false);
     }
 );
+
+it("agrees on structural keywords in named and inline alternatives", () => {
+    const rules: SchemaObject = { properties: { name: { type: "string" } }, items: { type: "string" } };
+    const integer: SchemaObject = { type: "integer" };
+    const components = { Rules: rules, Alias: { $ref: "#/components/schemas/Rules" } };
+    for (const branch of [rules, { $ref: "#/components/schemas/Alias" }]) {
+        const schema = generate({ ...components, Response: { anyOf: [branch, integer] } });
+        for (const value of [1.5, 2, true, "text", null, { name: "ok" }, ["ok"]]) {
+            expect(schema.parse(value)).toEqual(value);
+        }
+        for (const value of [{ name: 2 }, [2]]) expect(schema.safeParse(value).success).toBe(false);
+    }
+    expect(generate({ Response: integer }).safeParse(1.5).success).toBe(false);
+});
+
+it("preserves parsed array items with inline and referenced object-only allOf checks", () => {
+    const rules: SchemaObject = { properties: { name: { type: "string" } } };
+    const rows: SchemaObject = {
+        type: "array",
+        items: { type: "object", properties: { id: { type: "integer" } }, additionalProperties: false },
+    };
+    const alias = { allOf: [{ $ref: "#/components/schemas/Rules" }] };
+    for (const operand of [rules, { $ref: "#/components/schemas/Alias" }]) {
+        for (const array of [rows, { items: rows.items! }]) {
+            for (const allOf of [
+                [array, operand],
+                [operand, array],
+            ]) {
+                const schema = generate({ Rules: rules, Alias: alias, Response: { allOf } });
+                expect(schema.parse([{ id: 1, extra: true }])).toEqual([{ id: 1 }]);
+                expect(schema.safeParse([{ id: "bad" }]).success).toBe(false);
+            }
+        }
+    }
+});

@@ -8,18 +8,22 @@ import type { DocumentResolver } from "./makeSchemaResolver";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import {
     acceptsNull,
-    applicableStructuralOperand,
+    finiteStructuralAlternatives,
     hasImpossibleRequiredKey,
     hasStructuralKeywords,
     hasStructuralLiteral,
     intersectionOperands,
+    lowerStructuralConditional,
     needsCompositionBranchNull,
     needsNullableChain,
-    normalizeLiteralAssertion,
+    normalizeValueSchema,
     oneOfNullGuard,
     requiredAdditionalKeys,
     schemaAssertionParts,
     schemaNegation,
+    structuralOneOfDomain,
+    structuralOneOfOverlaps,
+    structuralTypeUnion,
     useSiteDefault,
 } from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
@@ -83,8 +87,10 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
     const meta = {} as TsConversionArgs["meta"];
     const isInline = !inheritedMeta?.name;
 
-    const builtinType = (name: "Array" | "File" | "Readonly" | "Record" | "Exclude", args?: TypeDefinition[]) =>
-        t.reference(ctx?.resolver.resolveSchemaName(name) ? `globalThis.${name}` : name, args);
+    const builtinType = (
+        name: "Array" | "File" | "Readonly" | "ReadonlyArray" | "Record" | "Exclude",
+        args?: TypeDefinition[]
+    ) => t.reference(ctx?.resolver.resolveSchemaName(name) ? `globalThis.${name}` : name, args);
     const doWrapReadOnly = (theType: MaybeWrapReadOnlyType) =>
         options?.allReadonly ? builtinType("Readonly", [theType]) : theType;
 
@@ -100,7 +106,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
     let canBeWrapped = !isInline;
     const getTs = (): ts.Node | TypeDefinitionObject | string => {
         const branchType = (branch: SchemaObject | ReferenceObject) => {
-            const operand = applicableStructuralOperand(branch);
+            const operand = structuralTypeUnion(branch, ctx?.resolver) ?? branch;
             const value = emitTypescript({ schema: operand, ctx, meta, options }) as TypeDefinition;
             // The public output alias already includes each scalar's nullable flag. The input of
             // a referenced base validator can be narrower, so keep the branch wrapper on input.
@@ -108,6 +114,27 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 ? t.union([value, t.reference("null")])
                 : value;
         };
+
+        const conditional = lowerStructuralConditional(schema, ctx?.resolver);
+        if (conditional) {
+            const value = branchType(conditional.base);
+            if (ctx) ctx.hasDistinctInput = true;
+            return ctx?.input ? t.intersection([value, branchType(conditional.allowed)]) : (value as ts.TypeNode);
+        }
+
+        const finite = finiteStructuralAlternatives(schema, ctx?.resolver, options);
+        if (finite) {
+            const types = finite.map(({ base, literal, canPreserveLiteral }) => {
+                const parsed = branchType(base);
+                if (!canPreserveLiteral && ctx) {
+                    ctx.hasDistinctInput = true;
+                    if (!ctx.input) return parsed;
+                }
+
+                return t.intersection([parsed, branchType(literal)]);
+            });
+            return types.length > 0 ? t.union(types) : t.never();
+        }
 
         const withoutNull = (value: TypeDefinition) =>
             t.intersection([value, t.union([ts.factory.createTypeLiteralNode([]), t.undefined()])]);
@@ -122,7 +149,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         const parts = schemaAssertionParts(schema, ctx?.resolver);
         if (parts) {
             return t.intersection(
-                intersectionOperands(parts, ctx?.resolver).map((part, index) => {
+                intersectionOperands(parts, ctx?.resolver, false).map((part, index) => {
                     if (
                         index > 0 &&
                         (hasStructuralLiteral(part) || (isReferenceObject(schema) && hasStructuralKeywords(part))) &&
@@ -187,8 +214,8 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
             return t.reference(schemaName);
         }
 
-        const literal = normalizeLiteralAssertion(schema, ctx?.resolver);
-        if (literal) return emitTypescript({ schema: literal, ctx, meta, options });
+        const normalized = normalizeValueSchema(schema, ctx?.resolver);
+        if (normalized) return emitTypescript({ schema: normalized, ctx, meta, options });
 
         if (!schema.type && schema.enum) {
             return schema.enum.length > 0 ? t.union(schema.enum.map(literalType)) : t.never();
@@ -204,15 +231,22 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 });
             }
 
-            const types = schema.type.map(
-                (prop) =>
-                    emitTypescript({
-                        schema: { ...schema, type: prop },
-                        ctx,
-                        meta,
-                        options,
-                    }) as TypeDefinition
-            );
+            const hasArrayAlternative = schema.type.includes("array") && ctx?.resolver.supportsSchemaRefSiblings;
+            const types = schema.type.map((prop) => {
+                const value = emitTypescript({
+                    schema: { ...schema, type: prop },
+                    ctx,
+                    meta,
+                    options,
+                }) as TypeDefinition;
+                // Arrays can structurally match {} or a shape such as { length?: number } in TypeScript.
+                if (prop !== "object" || !hasArrayAlternative || !hasStructuralKeywords(schema)) return value;
+                const object =
+                    schema.additionalProperties ?? options?.additionalPropertiesDefaultValue ?? true
+                        ? builtinType("Record", [t.string(), t.unknown()])
+                        : t.type("", { "[globalThis.Symbol.iterator]": t.optional(t.never()) }).type;
+                return t.intersection([value, object]);
+            });
 
             return schema.nullable ? t.union([...types, t.reference("null")]) : t.union(types);
         }
@@ -237,8 +271,23 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
         if (schema.oneOf) {
             const types = schema.oneOf.map(branchType);
-
-            return compositionType(t.union(types), types);
+            const union = compositionType(t.union(types), types);
+            const domain =
+                !options?.schemaRefiner && structuralOneOfDomain(structuralOneOfOverlaps(schema.oneOf, ctx?.resolver));
+            if (!domain) return union;
+            const object = t.reference("object");
+            const allowedObject = domain.allowsArrays
+                ? object
+                : t.intersection([object, t.type("", { "[globalThis.Symbol.iterator]": t.optional(t.never()) }).type]);
+            return t.intersection([
+                union,
+                t.union([
+                    allowedObject,
+                    ...domain.scalars.map((kind) => t[kind]()),
+                    t.reference("null"),
+                    t.undefined(),
+                ]),
+            ]);
         }
 
         // anyOf accepts a value matching at least one branch; it does not imply an array.
@@ -251,7 +300,9 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         if (schema.allOf) {
             return compositionType(
                 schema.allOf.length > 0
-                    ? t.intersection(intersectionOperands(schema.allOf, ctx?.resolver).map(branchType))
+                    ? t.intersection(
+                          intersectionOperands(schema.allOf, ctx?.resolver, !options?.schemaRefiner).map(branchType)
+                      )
                     : t.unknown()
             );
         }
@@ -313,7 +364,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 }
             }
 
-            const array = doWrapReadOnly(builtinType("Array", [arrayOfType]));
+            const array = builtinType(options?.allReadonly ? "ReadonlyArray" : "Array", [arrayOfType]);
             return schema.nullable ? t.union([array, t.reference("null")]) : array;
         }
 

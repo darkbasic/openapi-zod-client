@@ -7,7 +7,7 @@ import { isReferenceObject } from "./isReferenceObject";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import { getZodChainableStringValidations, numberBounds } from "./scalarBounds";
 import {
-    applicableStructuralOperand,
+    finiteStructuralAlternatives,
     getSchemaReferenceChain,
     hasImpossibleRequiredKey,
     hasNullableObjectType,
@@ -17,13 +17,17 @@ import {
     intersectionOperands,
     isObjectOrNull,
     isUntypedStructural,
+    lowerStructuralConditional,
     needsCompositionBranchNull,
     needsNullableChain,
-    normalizeLiteralAssertion,
+    normalizeValueSchema,
     oneOfNullGuard,
     requiredAdditionalKeys,
     schemaAssertionParts,
     schemaNegation,
+    structuralOneOfDomain,
+    structuralOneOfOverlaps,
+    structuralTypeUnion,
     useSiteDefault,
 } from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
@@ -92,7 +96,9 @@ function discriminatorOption(
     const tag = tagLayers.at(-1);
     const isRequired = schema.required?.length ? schema.required.includes(key) : options?.withImplicitRequiredProps;
     const values = discriminatorValues(tag, !isRequired, ctx?.resolver);
+    const canMatchOtherTypes = !objectType && !!ctx?.resolver.supportsSchemaRefSiblings;
     hasOpaqueShape ||=
+        canMatchOtherTypes ||
         isObjectOrNull(schema.type) ||
         !!hasNullableObjectBase(schema) ||
         needsCompositionBranchNull(schema, ctx?.resolver) ||
@@ -100,7 +106,7 @@ function discriminatorOption(
     const hasWrappedTag = tagLayers.some((layer) => hasCompositionWrapper(layer, ctx));
     let canDispatch = !hasOpaqueShape && !hasWrappedTag && values.length > 0;
     for (const value of values) {
-        if (usedTags.has(value)) canDispatch = false;
+        canDispatch &&= !usedTags.has(value);
         usedTags.add(value);
     }
 
@@ -117,7 +123,7 @@ function discriminatorValues(
     resolver: ConversionTypeContext["resolver"] | undefined
 ): unknown[] {
     if (!tag || isReferenceObject(tag)) return [];
-    tag = normalizeLiteralAssertion(tag, resolver) ?? tag;
+    tag = normalizeValueSchema(tag, resolver) ?? tag;
     const tagType = unwrapSingleType(tag.type);
     if (!tagType || Array.isArray(tagType) || !isPrimitiveType(tagType) || tag.oneOf || tag.anyOf || tag.allOf)
         return [];
@@ -161,10 +167,17 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     const schema = options?.schemaRefiner
         ? normalizeBooleanSchema(options.schemaRefiner($schema, inheritedMeta) ?? $schema)
         : $schema;
-    const negated = schemaNegation(schema, ctx?.resolver);
+    const conditional = lowerStructuralConditional(schema, ctx?.resolver);
+    const negated = conditional ? undefined : schemaNegation(schema, ctx?.resolver);
     const parts = negated ? undefined : schemaAssertionParts(schema, ctx?.resolver);
     // A reference with siblings is a composition. Only its actual reference operand enters the recursion stack.
-    const expressionSchema = negated ? { allOf: [negated.positive] } : parts ? { allOf: parts } : schema;
+    const expressionSchema = conditional
+        ? { allOf: [conditional.base, conditional.allowed] }
+        : negated
+        ? { allOf: [negated.positive] }
+        : parts
+        ? { allOf: parts }
+        : schema;
     const code = new CodeMeta(expressionSchema, ctx, inheritedMeta);
     const meta = {
         parent: code.inherit(inheritedMeta?.parent),
@@ -172,10 +185,20 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     };
 
     const branchCode = (branch: SchemaObject | ReferenceObject) => {
-        const operand = applicableStructuralOperand(branch);
+        const operand = structuralTypeUnion(branch, ctx?.resolver) ?? branch;
         const value = emitZodSchema({ schema: operand, ctx, meta, options }).toString();
         return needsCompositionBranchNull(operand, ctx?.resolver) ? value + ".nullable()" : value;
     };
+
+    if (conditional) return code.assign(guardInput(branchCode(conditional.base), branchCode(conditional.allowed)));
+
+    const finite = finiteStructuralAlternatives(schema, ctx?.resolver, options);
+    if (finite) {
+        const branches = finite.map(({ base, literal, canPreserveLiteral }) =>
+            (canPreserveLiteral ? intersectTypeGuard : guardInput)(branchCode(base), branchCode(literal))
+        );
+        return code.assign(branches.length > 1 ? `z.union([${branches.join(", ")}])` : branches[0] ?? "z.never()");
+    }
 
     if (negated) {
         const base = branchCode(negated.positive);
@@ -194,7 +217,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     const conjunction = parts ?? (!isReferenceObject(schema) && schema.allOf);
     if (conjunction) {
         if (conjunction.length === 0) return code.assign("z.unknown()");
-        const operands = intersectionOperands(conjunction, ctx?.resolver);
+        const operands = intersectionOperands(conjunction, ctx?.resolver, !parts && !options?.schemaRefiner);
         let expression = branchCode(operands[0]!);
         for (const operand of operands.slice(1)) {
             const sibling: SchemaObject = { ...operand };
@@ -218,7 +241,10 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
                 continue;
             }
 
-            if (isUntypedStructural(sibling)) {
+            const structuralTarget = ctx?.resolver.supportsSchemaRefSiblings
+                ? getSchemaReferenceChain(sibling, ctx.resolver).at(-1)!
+                : sibling;
+            if (isUntypedStructural(structuralTarget)) {
                 // Object parsers may contribute defaults/fields. For other JSON values preserve the base's parsed
                 // result: an intersection would merge raw array elements back over the parsed array.
                 expression = `((base, rule) => z.custom<z.input<typeof base> & z.input<typeof rule>>(
@@ -278,8 +304,8 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
         return code;
     }
 
-    const literal = normalizeLiteralAssertion(schema, ctx?.resolver);
-    if (literal) return emitZodSchema({ schema: literal, ctx, meta, options });
+    const normalized = normalizeValueSchema(schema, ctx?.resolver);
+    if (normalized) return emitZodSchema({ schema: normalized, ctx, meta, options });
 
     if (!schema.type && schema.enum) {
         const members = schema.enum.map(literalSchema);
@@ -292,11 +318,21 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             return emitZodSchema({ schema: { ...schema, type: schema.type[0]! }, ctx, meta, options });
         }
 
-        return code.assign(
-            `z.union([${schema.type
-                .map((prop) => emitZodSchema({ schema: { ...schema, type: prop }, ctx, meta, options }))
-                .join(", ")}])`
-        );
+        const hasArrayAlternative = schema.type.includes("array") && ctx?.resolver.supportsSchemaRefSiblings;
+        const types = schema.type.map((kind) => {
+            const value = emitZodSchema({ schema: { ...schema, type: kind }, ctx, meta, options }).toString();
+            if (
+                kind !== "object" ||
+                !hasArrayAlternative ||
+                (schema.additionalProperties ?? options?.additionalPropertiesDefaultValue ?? true)
+            )
+                return value;
+            // A stripped object has no string index signature. Exclude arrays with a matching
+            // property (e.g. length) from its inferred input and output as well as its runtime parser.
+            return `((object): z.ZodType<z.output<typeof object> & { [globalThis.Symbol.iterator]?: never },
+                z.ZodTypeDef, z.input<typeof object> & { [globalThis.Symbol.iterator]?: never }> => object)(${value})`;
+        });
+        return code.assign(`z.union([${types.join(", ")}])`);
     }
 
     if (schema.type === "null") {
@@ -337,15 +373,20 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
 
             if (branches.some((branch) => branch?.needsTagCheck)) {
                 // A plain union sees defaults during parsing. Discriminator dispatch checks the raw tag first.
+                const skipTag = ctx?.resolver.supportsSchemaRefSiblings
+                    ? "z.getParsedType(value) !== z.ZodParsedType.object"
+                    : "value === null";
                 types = types.map((type, index) =>
                     branches[index]?.needsTagCheck
-                        ? `((schema) => z.custom<z.input<typeof schema>>((value) => value === null || (value !== undefined && value[${key}] !== undefined)).pipe(schema))(${type})`
+                        ? `((schema) => z.custom<z.input<typeof schema>>((value) => ${skipTag} || (value !== undefined && value[${key}] !== undefined)).pipe(schema))(${type})`
                         : type
                 );
             }
         }
 
-        return assignComposition(`z.union([${types.join(", ")}])`);
+        const union = `z.union([${types.join(", ")}])`;
+        const overlaps = options?.schemaRefiner ? [] : structuralOneOfOverlaps(schema.oneOf, ctx?.resolver);
+        return assignComposition(guardStructuralOneOf(union, overlaps));
     }
 
     // anyOf accepts a value matching at least one branch; it does not imply an array.
@@ -517,6 +558,36 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
 function getDictionaryValueSchema({ schema, ctx, meta, options }: ConversionArgs): string {
     const value = emitZodSchema({ schema, ctx, meta, options }).toString();
     return applyUseSite(value, { schema, ctx, meta: { ...meta, isRequired: true }, options }, "dictionaryEntry");
+}
+
+function guardStructuralOneOf(union: string, overlaps: ReturnType<typeof structuralOneOfOverlaps>) {
+    if (overlaps.length === 0) return union;
+    const excluded = overlaps.filter(({ always }) => always > 1);
+    const domain = structuralOneOfDomain(overlaps);
+    const allowedType =
+        domain &&
+        [
+            domain.allowsArrays ? "object" : "(object & { [globalThis.Symbol.iterator]?: never })",
+            ...domain.scalars,
+            "null",
+            "undefined",
+        ].join(" | ");
+    const allowedOutput = excluded.map(({ kind }) => `z.getParsedType(value) !== z.ZodParsedType.${kind}`).join(" && ");
+    const cases = overlaps.map(({ kind, always, checks }) => {
+        const rules = checks.map((i) => `schema.options[${i}]`);
+        const unique =
+            always > 1
+                ? "false"
+                : rules.length === 1
+                ? `!${rules[0]}.safeParse(value).success`
+                : `[${rules.join(", ")}].filter((rule) => rule.safeParse(value).success).length < ${2 - always}`;
+        return `case z.ZodParsedType.${kind}: return ${unique};`;
+    });
+    const input = allowedType ? `z.input<typeof schema> & (${allowedType})` : "z.input<typeof schema>";
+    const narrow = allowedType ? `.refine((value): value is typeof value & (${allowedType}) => ${allowedOutput})` : "";
+    return `((schema) => z.custom<${input}>((value) => {
+        switch (z.getParsedType(value)) { ${cases.join("\n")} default: return true; }
+    }).pipe(schema)${narrow})(${union})`;
 }
 
 // Check the supplied value before the base schema strips keys or fills defaults.
