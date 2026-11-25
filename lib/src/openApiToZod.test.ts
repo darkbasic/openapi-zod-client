@@ -9,6 +9,21 @@ const makeSchema = (schema: SchemaObject) => schema;
 const getSchemaAsZodString = (schema: SchemaObject, meta?: CodeMetaData | undefined) =>
     getZodSchema({ schema: makeSchema(schema), meta }).toString();
 
+test("custom resolvers without a dialect flag retain OpenAPI 3.0 reference semantics", () => {
+    const info = { ref: "#/schemas/Id", name: "Id", normalized: "Id" };
+    const ctx: ConversionTypeContext = {
+        schemaByName: {},
+        zodSchemaByName: {},
+        resolver: {
+            getSchemaByRef: () => ({ type: "integer" }),
+            resolveRef: () => info,
+            resolveSchemaName: () => info,
+        },
+    };
+    expect(getZodSchema({ schema: { $ref: info.ref, type: "string" }, ctx }).toString()).toBe("Id");
+    expect(ctx.zodSchemaByName[info.name]).toBe("z.number().int()");
+});
+
 test("getSchemaAsZodString", () => {
     expect(getSchemaAsZodString({ type: "null" })).toMatchInlineSnapshot('"z.null()"');
     expect(getSchemaAsZodString({ type: "null", enum: ["Dogs", "Cats", "Mice"] })).toMatchInlineSnapshot(`"z.never()"`);

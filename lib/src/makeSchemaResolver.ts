@@ -58,4 +58,7 @@ export const makeSchemaResolver = (doc: OpenAPIObject) => {
     };
 };
 
-export type DocumentResolver = ReturnType<typeof makeSchemaResolver>;
+export type DocumentResolver = Omit<ReturnType<typeof makeSchemaResolver>, "supportsSchemaRefSiblings"> & {
+    /** Custom resolvers default to OpenAPI 3.0 reference semantics. */
+    supportsSchemaRefSiblings?: boolean;
+};

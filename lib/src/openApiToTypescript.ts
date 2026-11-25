@@ -114,7 +114,9 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         const negated = schemaNegation(schema, ctx?.resolver);
         if (negated) {
             const value = branchType(negated.positive);
-            return negated.excludesNull ? withoutNull(value) : (value as ts.TypeNode);
+            if (negated.excludesNull === undefined) return value as ts.TypeNode;
+            const present = ts.factory.createTypeLiteralNode([]);
+            return t.intersection([value, negated.excludesNull ? present : t.union([present, t.reference("null")])]);
         }
 
         const parts = schemaAssertionParts(schema, ctx?.resolver);

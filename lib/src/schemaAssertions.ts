@@ -35,6 +35,47 @@ type SchemaAssertions = SchemaObject & {
 };
 type NullMatch = boolean | "unknown";
 
+const schemaAnnotations = [
+    "default",
+    "title",
+    "description",
+    "example",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+// The static references have already been resolved. These keywords do not validate the JSON instance.
+const nonAssertionKeys = new Set([
+    ...schemaAnnotations,
+    "$ref",
+    "$comment",
+    "$id",
+    "$schema",
+    "$vocabulary",
+    "$anchor",
+    "$dynamicAnchor",
+    "$defs",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "externalDocs",
+    "xml",
+]);
+const scalarAssertionKeys = [
+    "type",
+    "enum",
+    "const",
+    "nullable",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+];
+const exactNegationKeys = new Set([...scalarAssertionKeys, "multipleOf", "minItems", "maxItems"]);
+
 const everyMatch = (matches: NullMatch[]): NullMatch =>
     matches.includes(false) ? false : matches.includes("unknown") ? "unknown" : true;
 
@@ -128,23 +169,28 @@ export function schemaNegation(schema: Schema, resolver?: DocumentResolver) {
     if (!local.not || (local.$ref && !resolver?.supportsSchemaRefSiblings)) return;
     const { not, ...positive } = local;
     // Negating a permissive approximation (e.g. an unimplemented contains) rejects valid data.
-    // Only invert exact type/literal predicates. Other predicates can still decide the null case.
+    // Only invert predicates the positive validator implements exactly. Other predicates can still decide the null case.
     if ("not" in not && not.not && Object.keys(not).length === 1) {
         return { positive: Object.keys(positive).length > 0 ? { allOf: [positive, not.not] } : not.not };
     }
 
-    const target = getSchemaReferenceChain(not, resolver).at(-1);
-    if (target && Object.keys(target).length === 0 && (!isReferenceObject(not) || Object.keys(not).length === 1)) {
-        return { positive: { enum: [] } };
+    const chain = getSchemaReferenceChain(not, resolver);
+    const target = chain.at(-1)!;
+    let excluded: Schema | undefined;
+    if (!isReferenceObject(target)) {
+        if (target.enum?.length === 0) return { positive };
+        // In 3.1 an assertion on any reference in the chain narrows even an empty target.
+        const layers = resolver?.supportsSchemaRefSiblings ? chain : [target];
+        const keys = layers
+            .flatMap((layer) => Object.keys(layer))
+            .filter((key) => !nonAssertionKeys.has(key) && !key.startsWith("x-"));
+        if (keys.length === 0) return { positive: { enum: [] } };
+        if (keys.every((key) => exactNegationKeys.has(key))) excluded = not;
     }
 
-    if (target && "enum" in target && target.enum?.length === 0) return { positive };
-    const isExact =
-        target &&
-        !isReferenceObject(target) &&
-        Object.keys(target).every((key) => ["type", "enum", "const", "nullable"].includes(key)) &&
-        (!isReferenceObject(not) || (Object.keys(not).length === 1 && target === resolver?.getSchemaByRef(not.$ref)));
-    return { positive, excluded: isExact ? not : undefined, excludesNull: acceptsNull(not, resolver) === true };
+    const shouldExcludeNull = acceptsNull(not, resolver) === true;
+    if (!excluded && !shouldExcludeNull && positive.type) return { positive };
+    return { positive, excluded, excludesNull: shouldExcludeNull };
 }
 
 // The reference owns the parsed value. A sibling can validate supplied fields, even fields the base strips.
@@ -329,28 +375,7 @@ function sameLiteral(left: unknown, right: unknown): boolean {
     );
 }
 
-const provenScalarKeys = new Set([
-    "$ref",
-    "type",
-    "enum",
-    "const",
-    "minLength",
-    "maxLength",
-    "pattern",
-    "minimum",
-    "maximum",
-    "exclusiveMinimum",
-    "exclusiveMaximum",
-    "default",
-    "nullable",
-    "title",
-    "description",
-    "example",
-    "examples",
-    "deprecated",
-    "readOnly",
-    "writeOnly",
-]);
+const provenScalarKeys = new Set(["$ref", ...scalarAssertionKeys, "pattern", ...schemaAnnotations]);
 
 function excludesLiteral(schema: Schema, candidate: unknown) {
     const local: SchemaAssertions = { ...schema };

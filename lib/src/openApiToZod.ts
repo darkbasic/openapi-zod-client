@@ -178,12 +178,17 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     };
 
     if (negated) {
-        const shouldRejectNull = negated.excludesNull === true;
-        const narrow = shouldRejectNull ? " & (globalThis.NonNullable<unknown> | undefined)" : "";
         const base = branchCode(negated.positive);
-        if (!negated.excluded && !shouldRejectNull) return code.assign(base);
-        const rule = negated.excluded ? branchCode(negated.excluded) : "z.null()";
-        return code.assign(guardInput(base, rule, true, narrow));
+        if (negated.excludesNull === undefined) return code.assign(base);
+        // Absence belongs to the property/default wrapper. A JSON value satisfying "not" must exist.
+        const type = negated.excludesNull
+            ? "globalThis.NonNullable<unknown>"
+            : "(globalThis.NonNullable<unknown> | null)";
+        const present = negated.excludesNull ? "value != null" : 'typeof value !== "undefined"';
+        const rule = negated.excluded ? branchCode(negated.excluded) : "null";
+        return code.assign(`((base, rule: z.ZodTypeAny | null) => z.custom<z.input<typeof base> & ${type}>(
+            (value) => ${present} && !rule?.safeParse(value).success)
+            .pipe(base).refine((value): value is typeof value & ${type} => ${present}))(${base}, ${rule})`);
     }
 
     const conjunction = parts ?? (!isReferenceObject(schema) && schema.allOf);
@@ -515,12 +520,9 @@ function getDictionaryValueSchema({ schema, ctx, meta, options }: ConversionArgs
 }
 
 // Check the supplied value before the base schema strips keys or fills defaults.
-function guardInput(base: string, rule: string, negated = false, nonNullable = ""): string {
-    const outputGuard = nonNullable ? `.refine((value): value is typeof value${nonNullable} => value !== null)` : "";
-    return `((base, rule) => z.custom<z.input<typeof base>${
-        negated ? nonNullable : " & z.input<typeof rule>"
-    }>((value) => ${negated ? "!" : ""}rule.safeParse(value).success)
-        .pipe(base)${outputGuard})(${base}, ${rule})`;
+function guardInput(base: string, rule: string): string {
+    return `((base, rule) => z.custom<z.input<typeof base> & z.input<typeof rule>>((value) => rule.safeParse(value).success)
+        .pipe(base))(${base}, ${rule})`;
 }
 
 const intersectTypeGuard = (base: string, rule: string) =>

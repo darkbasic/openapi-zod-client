@@ -25,6 +25,76 @@ function loadSchemas(source: string): {
     );
 }
 
+test.each(["3.0.3", "3.1.0"])("negates the effective constraints of a reference chain (%s)", async (openapi) => {
+    const schemas: Record<string, SchemaObject> = {
+        AnyValue: {},
+        Documented: {
+            ...ref("AnyValue"),
+            description: "Unconstrained JSON",
+            default: "example",
+            $defs: { unused: { type: "integer" } },
+            "x-ui-label": "Any value",
+        },
+        Text: { ...ref("Documented"), type: "string", title: "Text" },
+        Alias: ref("Text"),
+        NonText: { not: ref("Alias") },
+        Integer: { type: "integer", not: ref("Alias") },
+        Nothing: { not: ref("Documented") },
+        LongText: { ...ref("Text"), minLength: 2 },
+        WithoutLongText: { not: ref("LongText") },
+        HasMarker: { ...ref("AnyValue"), type: "array", contains: { const: "marker" } },
+        WithoutMarker: { not: ref("HasMarker") },
+        RestoredObject: { not: { not: { type: "object" } } },
+        Holder: {
+            type: "object",
+            properties: {
+                required: ref("NonText"),
+                optional: ref("NonText"),
+                defaulted: { ...ref("NonText"), default: 17 },
+            },
+            required: ["required"],
+        },
+    };
+    const source = await generateZodClientFromOpenAPI({
+        openApiDoc: {
+            openapi,
+            info: { title: "Negated aliases", version: "1" },
+            paths: { "/integer": response(ref("Integer")) },
+            components: { schemas },
+        },
+        disableWriteToFile: true,
+        options: { shouldExportAllSchemas: true, shouldExportAllTypes: true },
+    });
+    const client = loadSchemas(source);
+    const supportsSiblings = openapi === "3.1.0";
+    for (const value of [17, null, {}, []]) {
+        expect(client.schemas.NonText!.safeParse(value).success).toBe(supportsSiblings);
+        expect(client.schemas.Nothing!.safeParse(value).success).toBe(false);
+    }
+    expect(client.schemas.NonText!.safeParse("text").success).toBe(false);
+    expect(client.endpoints[0]!.response.safeParse(17).success).toBe(supportsSiblings);
+    expect(client.endpoints[0]!.response.safeParse(1.5).success).toBe(false);
+    expect(client.schemas.WithoutLongText!.safeParse("😀").success).toBe(supportsSiblings);
+    expect(client.schemas.WithoutLongText!.safeParse("ab").success).toBe(false);
+    // The generated positive validator approximates "contains". Inverting it would reject valid arrays.
+    expect(client.schemas.WithoutMarker!.safeParse(["other"]).success).toBe(supportsSiblings);
+    expect(client.schemas.RestoredObject!._def.typeName).toBe("ZodObject");
+    expect(client.schemas.Holder!.safeParse({}).success).toBe(false);
+    if (supportsSiblings) {
+        expect(client.schemas.Holder!.parse({ required: null })).toEqual({ required: null, defaulted: 17 });
+        expect(client.schemas.Holder!.safeParse({ required: 17, optional: "text" }).success).toBe(false);
+        expect(
+            typeErrors(`${source}
+const valid: z.input<typeof Holder> = { required: null };
+// @ts-expect-error omitting a required negated property is invalid
+const missing: z.input<typeof Holder> = {};
+// @ts-expect-error parsed output preserves the required property
+const absent: z.output<typeof Holder> = { defaulted: 17 };
+`)
+        ).toEqual([]);
+    }
+});
+
 test.each([
     { complexityThreshold: 0, allReadonly: false },
     { complexityThreshold: -1, allReadonly: true },
