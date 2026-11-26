@@ -19,7 +19,6 @@ import {
     intersectionOperands,
     isObjectOrNull,
     isUntypedStructural,
-    lowerStructuralConditional,
     needsCompositionBranchNull,
     needsNullableChain,
     normalizeValueSchema,
@@ -27,6 +26,7 @@ import {
     requiredAdditionalKeys,
     schemaAssertionParts,
     schemaNegation,
+    structuralConditionalParser,
     structuralOneOfDomain,
     structuralOneOfOverlaps,
     structuralTypeUnion,
@@ -169,7 +169,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     const schema = options?.schemaRefiner
         ? normalizeBooleanSchema(options.schemaRefiner($schema, inheritedMeta) ?? $schema)
         : $schema;
-    const conditional = lowerStructuralConditional(schema, ctx?.resolver);
+    const conditional = structuralConditionalParser(schema, ctx?.resolver, options);
     const negated = conditional ? undefined : schemaNegation(schema, ctx?.resolver, options);
     const parts = negated ? undefined : schemaAssertionParts(schema, ctx?.resolver);
     // A reference with siblings is a composition. Only its actual reference operand enters the recursion stack.
@@ -201,7 +201,13 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             return needsCompositionBranchNull(scalar, ctx?.resolver) ? value + ".nullable()" : value;
         });
 
-    if (conditional) return code.assign(guardInput(branchCode(conditional.base), branchCode(conditional.allowed)));
+    if (conditional) {
+        const base = branchCode(conditional.base);
+        if (!conditional.raw) return code.assign(guardInput(base, branchCode(conditional.allowed)));
+        // Preserve field errors from the base even when the raw conditional also fails.
+        return code.assign(`${base}.transform(data => ({ data }))
+            .and(${rawCode(conditional.raw)}.transform(() => ({}))).transform(({ data }) => data)`);
+    }
 
     const finite = finiteStructuralAlternatives(schema, ctx?.resolver, options);
     if (finite) {
@@ -622,6 +628,11 @@ function rawAssertionCode(
             assertions.push(
                 rules.length > 0 ? `[${rules.join(", ")}].filter((check) => check(value)).length === 1` : "false"
             );
+        }
+
+        if (step.condition) {
+            const { test, yes, no } = step.condition;
+            assertions.push(`(check${test}(value) ? check${yes}(value) : check${no}(value))`);
         }
 
         if (step.not !== undefined) assertions.push(`!check${step.not}(value)`);

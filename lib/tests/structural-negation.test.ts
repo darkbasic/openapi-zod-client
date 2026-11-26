@@ -314,3 +314,104 @@ test("keeps OpenAPI 3.0 reference sibling and array negation behavior", async ()
     expect(client.Pure!.safeParse([]).success).toBe(false);
     expect(client.Pure!.parse([1])).toEqual([1]);
 });
+
+test.each([false, true])("evaluates structural if/then/else on the supplied JSON (explicit: %s)", async (explicit) => {
+    const whenText = { properties: { kind: { const: "text" } } };
+    const text = { properties: { text: { type: "string" } } };
+    const other = { properties: { count: { type: "integer" } } };
+    const conditional = { properties: { kind: { type: "string" } }, if: whenText, then: text, else: other };
+    const nested = { ...conditional, then: { if: { required: ["text"] }, then: text, else: false } };
+    const schemas: Record<string, SchemaObject> = {
+        Rows: { items: conditional },
+        TypedRows: arrayOf(conditional),
+        OnlyObjects: { properties: conditional.properties, if: { required: ["kind"] }, then: { type: "object" } },
+        ObjectsOrNull: {
+            properties: conditional.properties,
+            if: { required: ["kind"] },
+            then: { type: ["object", "null"] },
+        },
+        Test: whenText,
+        Text: text,
+        Other: other,
+        Named: { ...conditional, if: ref("Test"), then: ref("Text"), else: ref("Other") },
+        Nested: nested,
+        Negated: { not: nested },
+        Exclusive: { oneOf: [conditional, { type: "string" }] },
+        Composed: {
+            allOf: [{ properties: conditional.properties }, { maxItems: 3 }],
+            if: whenText,
+            then: text,
+            else: other,
+        },
+        UnknownArrayTest: {
+            properties: conditional.properties,
+            if: { contains: { const: 1 } },
+            then: { required: ["text"] },
+            else: { not: { required: ["text"] } },
+        },
+        Fallback: { ...conditional, if: { patternProperties: { "^n": { type: "string" } } } },
+        Defaults: {
+            properties: { name: { type: "string" }, label: { type: "string", default: "base" } },
+            required: ["name"],
+            additionalProperties: false,
+            if: { required: ["check"] },
+            then: { required: ["label"] },
+        },
+    };
+    const { client, source } = await generate(schemas, explicit);
+    const oracle = new Ajv2020({ strict: false });
+    const data = [
+        null,
+        "shortcut",
+        1,
+        false,
+        [],
+        {},
+        { kind: "x", count: 2 },
+        { kind: "x", count: "bad" },
+        { kind: "text", text: "ok" },
+        { kind: "text", text: 2 },
+        { kind: "text" },
+        { kind: 1 },
+    ];
+    for (const [name, rule] of Object.entries({
+        Named: conditional,
+        Nested: nested,
+        Negated: { not: nested },
+        Exclusive: schemas.Exclusive!,
+        Composed: schemas.Composed!,
+    })) {
+        const valid = oracle.compile(rule);
+        for (const value of data)
+            expect(client[name]!.safeParse(value).success, name + " on " + JSON.stringify(value)).toBe(valid(value));
+    }
+    const invalid = client.TypedRows!.safeParse([{ kind: 3, count: "x" }]);
+    expect(invalid.error?.format()).toHaveProperty(["0", "kind", "_errors", "0"]);
+    const validItem = oracle.compile(conditional);
+    for (const value of data) {
+        for (const rows of [client.Rows!, client.TypedRows!])
+            expect(rows.safeParse([value]).success).toBe(validItem(value));
+    }
+    // Neither branch can reject strings. An unresolved array condition cannot guarantee the same for arrays.
+    expect(client.UnknownArrayTest!.safeParse([]).success).toBe(false);
+    expect(client.Fallback!.parse("shortcut")).toBe("shortcut");
+    expect(client.Fallback!.safeParse({ kind: 1 }).success).toBe(false);
+    // Test and validate the raw fields before the base strips 'check' and supplies 'label'.
+    expect(client.Defaults!.safeParse({ name: "ok", check: true }).success).toBe(false);
+    expect(client.Defaults!.parse({ name: "ok" })).toEqual({ name: "ok", label: "base" });
+    expect(
+        typeErrors(
+            source +
+                `
+const item: z.input<typeof TypedRows>[number] = "shortcut";
+const parsed: z.output<typeof TypedRows>[number] = "shortcut";
+const validNull: z.output<typeof ObjectsOrNull> = null;
+// @ts-expect-error a nonobject always matches the raw required check and the selected branch excludes numbers
+const invalidNumber: z.input<typeof ObjectsOrNull> = 42;
+// @ts-expect-error null always matches the raw required check and the selected branch excludes null
+const invalidNull: z.output<typeof OnlyObjects> = null;
+
+`
+        )
+    ).toEqual([]);
+});

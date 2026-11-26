@@ -151,21 +151,28 @@ export function arrayProjection(
                 type === "array" || (Array.isArray(type) && type.every((kind) => kind === "array" || kind === "null"))
         )
     );
-    // A concrete array can reference its own elements. A conditional Extract around
-    // the same recursive alias would be an illegal circular type declaration.
-    const itemTypes = members.map((layers) => {
-        if (
-            !layers ||
-            layers.some(
-                (layer) => layer.oneOf ?? layer.anyOf ?? layer.allOf ?? layer.enum ?? Object.hasOwn(layer, "const")
-            )
-        )
-            return;
-        const items = layers.flatMap((layer) => (layer.items ? [layer.items] : []));
-        return items.length === 1 ? items[0] : undefined;
-    });
+    // Only a union at the array level selects a branch for the entire list.
+    // Alternatives inside items are already represented by the element type.
+    const unionProducers = members
+        .filter((_, i) => contributes[i])
+        .map(
+            (layers) =>
+                !layers ||
+                layers.some(
+                    (layer) => layer.anyOf ?? layer.oneOf ?? (layer.enum?.filter(Array.isArray).length ?? 0) > 1
+                )
+        );
     const presence = arrayPresenceCandidates(operands, contributes, resolver);
-    return { decisions, contributes, isDynamic, isArrayOnly, isArrayOrNull, itemTypes, presence };
+    return {
+        decisions,
+        contributes,
+        isDynamic,
+        isArrayOnly,
+        isArrayOrNull,
+        unionProducers,
+        hasRecursiveItems: !presence,
+        presence: presence ?? [],
+    };
 }
 
 type Projection = NonNullable<ReturnType<typeof arrayProjection>>;
@@ -320,7 +327,13 @@ export function arrayProjectionCode(plan: Projection, refs: string[], other: str
         t.reference(`globalThis.Extract<z.output<typeof ${ref}>, readonly unknown[]>`)
     );
     const output = printTs(
-        arrayOutputType(outputs, plan.presence, (i) => t.reference(`z.input<typeof ${refs[i]}>`), readonly)
+        arrayOutputType(
+            outputs,
+            plan.presence,
+            (i) => t.reference(`z.input<typeof ${refs[i]}>`),
+            readonly,
+            plan.unionProducers
+        )
     );
     // Only narrow successful parses: a failed transform may carry an internal
     // intermediate value, which must not produce another validation issue.

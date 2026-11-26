@@ -6,6 +6,7 @@ import { arrayOutputType } from "./arrayItemPresence";
 import { arrayProjection } from "./arrayProjection";
 import generateJSDocArray from "./generateJSDocArray";
 import { isReferenceObject } from "./isReferenceObject";
+import { literalType } from "./literalType";
 import type { DocumentResolver } from "./makeSchemaResolver";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import {
@@ -15,7 +16,6 @@ import {
     hasStructuralKeywords,
     hasStructuralLiteral,
     intersectionOperands,
-    lowerStructuralConditional,
     needsCompositionBranchNull,
     needsNullableChain,
     normalizeValueSchema,
@@ -23,6 +23,7 @@ import {
     requiredAdditionalKeys,
     schemaAssertionParts,
     schemaNegation,
+    structuralConditionalParser,
     structuralOneOfDomain,
     structuralOneOfOverlaps,
     structuralTypeUnion,
@@ -61,18 +62,81 @@ type MaybeWrapReadOnlyType =
               | ts.EnumDeclaration;
       };
 
-const literalType = (value: unknown): TypeDefinition => {
-    if (Array.isArray(value)) return t.tuple(value.map(literalType));
-    if (value && typeof value === "object") {
-        return t.type(
-            "",
-            Object.fromEntries(Object.entries(value).map(([key, item]) => [JSON.stringify(key), literalType(item)]))
-        ).type;
-    }
+type ArrayBranch = { type: ts.TypeNode; item?: ts.TypeNode; fixed: boolean };
 
-    if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") return value;
-    return t.reference("null");
-};
+// TypeScript can defer Array<Tree>, but evaluating Extract<Array<Tree> | Leaf[], ...>
+// or a tuple-length conditional while declaring Tree makes the alias circular. Select
+// array alternatives from the emitted type, stopping before their element types.
+function recursiveArrayBranches(producers: ts.TypeNode[], expand: (name: string) => ts.TypeNode | undefined) {
+    const seen = new Map<string, ArrayBranch[] | undefined>();
+    const array = t.reference("globalThis.ReadonlyArray", [t.unknown()]);
+    const extract = (type: ts.TypeNode) => ({ type: t.reference("globalThis.Extract", [type, array]), fixed: false });
+    const visit = (node: ts.TypeNode): ArrayBranch[] | undefined => {
+        if (ts.isParenthesizedTypeNode(node)) return visit(node.type);
+        if (ts.isTupleTypeNode(node)) return [{ type: node, fixed: true }];
+        if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+            const name = node.typeName.text;
+            if (node.typeArguments?.length === 1 && /^(globalThis\.)?(Readonly)?Array$/.test(name))
+                return [{ type: node, item: node.typeArguments[0]!, fixed: false }];
+            if (!node.typeArguments && !seen.has(name)) {
+                seen.set(name, undefined);
+                const target = expand(name);
+                if (target) seen.set(name, visit(target));
+            }
+
+            return seen.get(name);
+        }
+
+        if (!ts.isUnionTypeNode(node) && !ts.isIntersectionTypeNode(node)) return;
+        if (node.types.length === 1) return visit(node.types[0]!);
+        const branches = node.types.map(visit);
+        if (!branches.some(Boolean)) return;
+        if (ts.isUnionTypeNode(node)) {
+            return [...new Set(branches.flatMap((branch, i) => branch ?? [extract(node.types[i]!)]))];
+        }
+
+        // A non-array conjunct can still constrain the array selected by another.
+        const type = t.intersection(
+            branches.map((branch, i) => (branch ? t.union(branch.map((part) => part.type)) : node.types[i]!))
+        );
+        return [{ type, fixed: branches.some((branch) => branch?.some((part) => part.fixed)) }];
+    };
+
+    return producers.map((type) => visit(type) ?? [extract(type)]);
+}
+
+function recursiveArrayOutput(
+    producers: ts.TypeNode[],
+    expand: (name: string) => ts.TypeNode | undefined,
+    readonly: boolean
+): ts.TypeNode {
+    const groups = recursiveArrayBranches(producers, expand);
+    if (groups.length === 1) return t.union(groups[0]!.map(({ type }) => type));
+    const items = (parts: ArrayBranch[]) =>
+        t.union(parts.map(({ type, item }) => item ?? ts.factory.createIndexedAccessTypeNode(type, t.number())));
+    const allItems = groups.map(items);
+    const list = (types: ts.TypeNode[]) =>
+        t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [
+            types.length > 0 ? t.intersection(types) : t.unknown(),
+        ]);
+    // The shared list supplies the array methods. Numeric index signatures preserve
+    // each producer's choice across positions without expanding every combination.
+    const constraints = groups.flatMap((parts) => {
+        if (parts.length === 1) return parts[0]!.fixed ? [parts[0]!.type] : [];
+        return [
+            t.union(
+                parts.map((part) =>
+                    part.fixed
+                        ? part.type
+                        : t.type("", {
+                              "readonly [index: number]": items([part]),
+                          }).type
+                )
+            ),
+        ];
+    });
+    return t.intersection([list(allItems), ...constraints]);
+}
 
 export const getTypescriptFromOpenApi = (args: Omit<TsConversionArgs, "schema"> & { schema: SchemaInput }) => {
     if (args.schema == null) throw new Error("Schema is required");
@@ -117,11 +181,13 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 : value;
         };
 
-        const conditional = lowerStructuralConditional(schema, ctx?.resolver);
+        const conditional = structuralConditionalParser(schema, ctx?.resolver, options);
         if (conditional) {
             const value = branchType(conditional.base);
             if (ctx) ctx.hasDistinctInput = true;
-            return ctx?.input ? t.intersection([value, branchType(conditional.allowed)]) : (value as ts.TypeNode);
+            return ctx?.input && !conditional.raw
+                ? t.intersection([value, branchType(conditional.allowed)])
+                : (value as ts.TypeNode);
         }
 
         const finite = finiteStructuralAlternatives(schema, ctx?.resolver, options);
@@ -156,23 +222,29 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
             ctx.hasDistinctInput = true;
             if (ctx.input) return all;
             const array = builtinType("ReadonlyArray", [t.unknown()]);
-            const producers = types.flatMap((type, i) => {
-                if (!plan.contributes[i]) return [];
-                const items = plan.itemTypes[i];
-                return [items ? branchType({ type: "array", items }) : builtinType("Extract", [type, array])];
-            });
-            const output = arrayOutputType(
-                producers.map((producer) => t.intersection([producer])),
-                plan.presence,
-                (i) =>
-                    emitTypescript({
-                        schema: operands[i]!,
-                        ctx: { ...ctx, input: true },
-                        meta,
-                        options,
-                    }) as ts.TypeNode,
-                !!options?.allReadonly
-            );
+            const producers = types.flatMap((type, i) => (plan.contributes[i] ? [t.intersection([type])] : []));
+            const output = plan.hasRecursiveItems
+                ? recursiveArrayOutput(
+                      producers,
+                      (name) => {
+                          const ref = ctx.resolver.resolveSchemaName(name)?.ref;
+                          return ref ? t.intersection([branchType(ctx.resolver.getSchemaByRef(ref))]) : undefined;
+                      },
+                      !!options?.allReadonly
+                  )
+                : arrayOutputType(
+                      producers.map((type) => builtinType("Extract", [type, array])),
+                      plan.presence,
+                      (i) =>
+                          emitTypescript({
+                              schema: operands[i]!,
+                              ctx: { ...ctx, input: true },
+                              meta,
+                              options,
+                          }) as ts.TypeNode,
+                      !!options?.allReadonly,
+                      plan.unionProducers
+                  );
             if (plan.isArrayOnly) return output;
             const nonArray = plan.isArrayOrNull
                 ? t.reference("null")

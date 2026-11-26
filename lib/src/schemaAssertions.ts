@@ -1,4 +1,5 @@
 import type { ReferenceObject, SchemaObject } from "openapi3-ts";
+import { pick } from "pastable";
 
 import { isReferenceObject } from "./isReferenceObject";
 import type { DocumentResolver } from "./makeSchemaResolver";
@@ -113,19 +114,31 @@ function matchingConditionalKinds(
 
 // Split a structural schema on a pure JSON-type condition. During the split, "number"
 // denotes the noninteger half of the numeric domain. Recombine both halves when possible.
-export function lowerStructuralConditional(schema: Schema, resolver?: ConditionalResolver) {
+export function lowerStructuralConditional(
+    schema: Schema,
+    resolver?: ConditionalResolver,
+    options?: TemplateContext["options"]
+) {
     if (!resolver?.supportsSchemaRefSiblings || !Object.hasOwn(schema, "if")) return;
-    const { if: test, then, else: otherwise, ...base }: SchemaAssertions = { ...schema };
+    const local: SchemaAssertions = { ...schema };
+    const { if: test, then, else: otherwise, ...base } = local;
     if (test === undefined || base.type) return;
     if (
         !hasStructuralKeywords(base) &&
-        !getConjunctiveSchemaLayers(base, resolver)?.some((layer) => !layer.type && hasStructuralKeywords(layer))
+        !getConjunctiveSchemaLayers(base, resolver, true)?.some((layer) => !layer.type && hasStructuralKeywords(layer))
     )
         return;
     if ((then === undefined || then === true) && (otherwise === undefined || otherwise === true))
         return { base, allowed: {} };
     const yes = matchingConditionalKinds(test, resolver);
-    if (!yes) return;
+    if (!yes) {
+        // A data-dependent condition validates the supplied JSON. The unconditional
+        // schema still owns defaults, stripping and the output type.
+        const condition: SchemaAssertions = pick(local, ["if", "then", "else"]);
+        const raw = options?.schemaRefiner ? undefined : rawStructuralAssertion(condition, resolver);
+        return raw && { base, allowed: {}, raw };
+    }
+
     const option = (kinds: ConditionalKind[], rule: Schema | boolean | undefined): SchemaObject[] => {
         if (rule === false || kinds.length === 0) return [];
         const types = kinds.filter((kind) => kind !== "integer" || !kinds.includes("number"));
@@ -143,6 +156,29 @@ export function lowerStructuralConditional(schema: Schema, resolver?: Conditiona
         ),
     ];
     return { base, allowed: branches.length > 1 ? { anyOf: branches } : branches[0] ?? { enum: [] } };
+}
+
+// A raw predicate can rule out entire JSON kinds. Keep those bounds in the
+// generated input and output, while the raw check handles value-dependent rules.
+export function structuralConditionalParser(
+    schema: Schema,
+    resolver?: DocumentResolver,
+    options?: TemplateContext["options"]
+) {
+    const plan = lowerStructuralConditional(schema, resolver, options);
+    if (!plan?.raw || !resolver) return plan;
+
+    const local: SchemaAssertions = { ...schema };
+    const kinds: Array<InstanceKind | "null"> = instanceKinds.filter(
+        (kind) => conditionalKindMatch(local, kind, resolver) !== "never"
+    );
+    if (conditionalNullMatch(local, (branch) => acceptsNull(branch, resolver)) !== false) kinds.push("null");
+    if (kinds.length === instanceKinds.length + 1) return plan;
+    const base: SchemaObject =
+        kinds.length > 0
+            ? { ...plan.base, type: kinds.length === 1 ? kinds[0]! : kinds, nullable: false }
+            : { enum: [] };
+    return { ...plan, base };
 }
 
 const everyMatch = (matches: NullMatch[]): NullMatch =>
@@ -317,6 +353,7 @@ type RawAssertionStep = {
     any: number[] | undefined;
     one: number[] | undefined;
     not: number | undefined;
+    condition: { test: number; yes: number; no: number } | undefined;
 };
 
 export type RawStructuralAssertion = {
@@ -332,7 +369,18 @@ function rawAdditional(rule: SchemaObject["additionalProperties"], visit: (schem
     return rule === false ? false : undefined;
 }
 
-function rawStructuralAssertion(schema: Schema, resolver: DocumentResolver): RawStructuralAssertion | undefined {
+function rawCondition(
+    test: SchemaAssertions["if"],
+    then: SchemaAssertions["then"],
+    otherwise: SchemaAssertions["else"],
+    visit: (schema: Schema) => number
+): RawAssertionStep["condition"] {
+    if (test === undefined || (then === undefined && otherwise === undefined)) return;
+    const branch = (rule: Schema | boolean = true) => visit(normalizeBooleanSchema(rule));
+    return { test: branch(test), yes: branch(then), no: branch(otherwise) };
+}
+
+function rawStructuralAssertion(schema: Schema, resolver: ConditionalResolver): RawStructuralAssertion | undefined {
     const steps: RawAssertionStep[] = [];
     const seen = new Map<Schema, number>();
     let hasStructure = false;
@@ -351,7 +399,21 @@ function rawStructuralAssertion(schema: Schema, resolver: DocumentResolver): Raw
         // Re-entering a node with no completed step means the proof is cyclic.
         seen.set(node, -1);
         const local: SchemaAssertions = { ...(positiveDoubleNegation(node) ?? node) };
-        const { $ref, properties, required, additionalProperties, items, allOf, anyOf, oneOf, not, ...rest } = local;
+        const {
+            $ref,
+            properties,
+            required,
+            additionalProperties,
+            items,
+            allOf,
+            anyOf,
+            oneOf,
+            not,
+            if: test,
+            then,
+            else: otherwise,
+            ...rest
+        } = local;
         const entries = Object.entries(rest).filter(([key]) => !nonAssertionKeys.has(key) && !key.startsWith("x-"));
         if (!entries.every(([key]) => canProveKeyword(rest, key))) return unresolved();
         const target = $ref ? resolver.getSchemaByRef($ref) : undefined;
@@ -362,7 +424,15 @@ function rawStructuralAssertion(schema: Schema, resolver: DocumentResolver): Raw
         hasUntyped ||= hasLocalStructure && !rest.type;
         const layers = [...(allOf ?? []), ...(target ? [target] : [])];
         const all = [...new Set(layers.map(visit))];
-        if (all.length === 1 && !anyOf && !oneOf && !not && entries.length === 0 && !hasLocalStructure) {
+        if (
+            all.length === 1 &&
+            !anyOf &&
+            !oneOf &&
+            !not &&
+            test === undefined &&
+            entries.length === 0 &&
+            !hasLocalStructure
+        ) {
             seen.set(node, all[0]!);
             return all[0]!;
         }
@@ -377,6 +447,7 @@ function rawStructuralAssertion(schema: Schema, resolver: DocumentResolver): Raw
             properties: Object.entries(properties ?? {}).map(([key, child]) => [key, visit(child)]),
             items: items && visit(items),
             additional: rawAdditional(additionalProperties, visit),
+            condition: rawCondition(test, then, otherwise, visit),
         };
         const index = steps.push(step) - 1;
         seen.set(node, index);
@@ -500,10 +571,10 @@ function instanceMatch(
     const visit = (schema: Schema): KindMatch => {
         const positive = positiveDoubleNegation(schema);
         if (positive) return visit(positive);
-        const conditional = lowerStructuralConditional(schema, resolver);
+        const conditional = lowerStructuralConditional(schema, resolver, options);
         if (conditional) {
             hasStructural = true;
-            return conjunctionMatch([visit(conditional.base), visit(conditional.allowed)]);
+            return conjunctionMatch([visit(conditional.base), conditional.raw ? "check" : visit(conditional.allowed)]);
         }
 
         const { $ref, oneOf, anyOf, allOf, not, ...local }: SchemaAssertions = { ...schema };
@@ -534,6 +605,19 @@ function instanceMatch(
 
     const match = visit(branch);
     return { match, hasStructural };
+}
+
+function conditionalKindMatch(schema: SchemaAssertions, kind: InstanceKind, resolver: DocumentResolver): KindMatch {
+    const match = (rule: Schema | boolean = true) => {
+        if (typeof rule === "boolean") return rule ? "always" : "never";
+        return instanceMatch(normalizeBooleanSchema(rule), kind, resolver).match;
+    };
+
+    const test = match(schema.if);
+    if (test === "always") return match(schema.then);
+    if (test === "never") return match(schema.else);
+    const yes = match(schema.then);
+    return yes === match(schema.else) ? yes : "unknown";
 }
 
 function optionMatch(
@@ -795,9 +879,18 @@ export function normalizeValueSchema(schema: SchemaAssertions, resolver?: Docume
         if (!types.includes("null")) return { ...schema, enum: schema.enum.filter((value) => value !== null) };
     }
 
-    // In 3.1 these keywords have the same domain in a component, property or composition.
-    // A conditional that could not be lowered keeps the existing standalone parser.
-    return resolver?.supportsSchemaRefSiblings && schema.if === undefined ? structuralTypeUnion(schema) : undefined;
+    if (!resolver?.supportsSchemaRefSiblings) return;
+    const structural = structuralTypeUnion(schema);
+    if (!structural || schema.if === undefined || !(schema.properties || schema.additionalProperties))
+        return structural;
+
+    // An unsupported condition previously used the ordinary object parser. Admit another
+    // JSON kind only if the conditional is guaranteed to accept that kind.
+    const kinds = instanceKinds.filter(
+        (kind) => kind === "object" || conditionalKindMatch(schema, kind, resolver) === "always"
+    );
+    const canAcceptNull = conditionalNullMatch(schema, (branch) => acceptsNull(branch, resolver)) === true;
+    return { ...schema, type: canAcceptNull ? [...kinds, "null"] : kinds };
 }
 
 export const isUntypedStructural = (schema: Schema): boolean =>
