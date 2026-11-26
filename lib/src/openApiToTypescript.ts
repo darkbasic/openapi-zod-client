@@ -46,6 +46,7 @@ export type TsConversionContext = {
     visitedsRefs?: Record<string, boolean>;
     input?: boolean;
     hasDistinctInput?: boolean;
+    nonArrayOutputs?: WeakSet<object>;
 };
 
 type MaybeWrapReadOnlyType =
@@ -64,53 +65,82 @@ type MaybeWrapReadOnlyType =
 
 type ArrayBranch = { type: ts.TypeNode; item?: ts.TypeNode; fixed: boolean };
 
+// An empty array list proves that the schema only produces non-arrays. Undefined
+// leaves an opaque type to TypeScript's normal Extract behavior.
+type ArrayParts = { arrays: ArrayBranch[] | undefined; other: ts.TypeNode | undefined };
+const recursiveArray = t.reference("globalThis.ReadonlyArray", [t.unknown()]);
+const extractArray = (type: ts.TypeNode) => ({
+    type: t.reference("globalThis.Extract", [type, recursiveArray]),
+    fixed: false,
+});
+
+function combineArrayParts(node: ts.UnionTypeNode | ts.IntersectionTypeNode, parts: ArrayParts[]): ArrayParts {
+    const others = parts.flatMap(({ other }) => other ?? []);
+    const isUnchanged = others.every((other, i) => other === node.types[i]) && others.length === node.types.length;
+    if (ts.isUnionTypeNode(node))
+        return {
+            arrays: [...new Set(parts.flatMap(({ arrays }, i) => arrays ?? [extractArray(node.types[i]!)]))],
+            other: isUnchanged ? node : others.length > 0 ? t.union(others) : undefined,
+        };
+
+    const other = isUnchanged ? node : others.length === parts.length ? t.intersection(others) : undefined;
+    if (parts.some(({ arrays }) => arrays?.length === 0)) return { arrays: [], other };
+    if (!parts.some(({ arrays }) => arrays)) return { arrays: undefined, other };
+    // An opaque conjunct may further constrain a known array or tuple.
+    const type = t.intersection(
+        parts.map(({ arrays }, i) => (arrays ? t.union(arrays.map((part) => part.type)) : node.types[i]!))
+    );
+    return { arrays: [{ type, fixed: parts.some(({ arrays }) => arrays?.some((part) => part.fixed)) }], other };
+}
+
 // TypeScript can defer Array<Tree>, but evaluating Extract<Array<Tree> | Leaf[], ...>
 // or a tuple-length conditional while declaring Tree makes the alias circular. Select
 // array alternatives from the emitted type, stopping before their element types.
-function recursiveArrayBranches(producers: ts.TypeNode[], expand: (name: string) => ts.TypeNode | undefined) {
-    const seen = new Map<string, ArrayBranch[] | undefined>();
-    const array = t.reference("globalThis.ReadonlyArray", [t.unknown()]);
-    const extract = (type: ts.TypeNode) => ({ type: t.reference("globalThis.Extract", [type, array]), fixed: false });
-    const visit = (node: ts.TypeNode): ArrayBranch[] | undefined => {
+function recursiveArrayParts(
+    types: ts.TypeNode[],
+    nonArrayOutputs: WeakSet<object>,
+    expand: (name: string) => ts.TypeNode | undefined
+) {
+    const seen = new Map<string, ArrayParts>();
+    const visit = (node: ts.TypeNode): ArrayParts => {
+        if (nonArrayOutputs.has(node) || ts.isLiteralTypeNode(node)) return { arrays: [], other: node };
         if (ts.isParenthesizedTypeNode(node)) return visit(node.type);
-        if (ts.isTupleTypeNode(node)) return [{ type: node, fixed: true }];
+        if (ts.isTupleTypeNode(node)) return { arrays: [{ type: node, fixed: true }], other: undefined };
+        const opaque = { arrays: undefined, other: node };
         if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
             const name = node.typeName.text;
+            if (name === "null") return { arrays: [], other: node };
             if (node.typeArguments?.length === 1 && /^(globalThis\.)?(Readonly)?Array$/.test(name))
-                return [{ type: node, item: node.typeArguments[0]!, fixed: false }];
-            if (!node.typeArguments && !seen.has(name)) {
-                seen.set(name, undefined);
+                return { arrays: [{ type: node, item: node.typeArguments[0]!, fixed: false }], other: undefined };
+            if (node.typeArguments) return opaque;
+            if (!seen.has(name)) {
+                seen.set(name, opaque);
                 const target = expand(name);
-                if (target) seen.set(name, visit(target));
+                if (target) {
+                    const parts = visit(target);
+                    seen.set(name, {
+                        arrays: parts.arrays,
+                        other: parts.other && !parts.arrays?.length ? node : parts.other,
+                    });
+                }
             }
 
-            return seen.get(name);
+            return seen.get(name)!;
         }
 
-        if (!ts.isUnionTypeNode(node) && !ts.isIntersectionTypeNode(node)) return;
+        if (!ts.isUnionTypeNode(node) && !ts.isIntersectionTypeNode(node)) return opaque;
         if (node.types.length === 1) return visit(node.types[0]!);
-        const branches = node.types.map(visit);
-        if (!branches.some(Boolean)) return;
-        if (ts.isUnionTypeNode(node)) {
-            return [...new Set(branches.flatMap((branch, i) => branch ?? [extract(node.types[i]!)]))];
-        }
-
-        // A non-array conjunct can still constrain the array selected by another.
-        const type = t.intersection(
-            branches.map((branch, i) => (branch ? t.union(branch.map((part) => part.type)) : node.types[i]!))
-        );
-        return [{ type, fixed: branches.some((branch) => branch?.some((part) => part.fixed)) }];
+        return combineArrayParts(node, node.types.map(visit));
     };
 
-    return producers.map((type) => visit(type) ?? [extract(type)]);
+    return types.map((type) => {
+        const { arrays, other } = visit(type);
+        return { arrays: arrays ?? [extractArray(type)], other };
+    });
 }
 
-function recursiveArrayOutput(
-    producers: ts.TypeNode[],
-    expand: (name: string) => ts.TypeNode | undefined,
-    readonly: boolean
-): ts.TypeNode {
-    const groups = recursiveArrayBranches(producers, expand);
+function recursiveArrayOutput(groups: ArrayBranch[][], readonly: boolean): ts.TypeNode {
+    if (groups.some((group) => group.length === 0)) return t.never();
     if (groups.length === 1) return t.union(groups[0]!.map(({ type }) => type));
     const items = (parts: ArrayBranch[]) =>
         t.union(parts.map(({ type, item }) => item ?? ts.factory.createIndexedAccessTypeNode(type, t.number())));
@@ -222,19 +252,24 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
             ctx.hasDistinctInput = true;
             if (ctx.input) return all;
             const array = builtinType("ReadonlyArray", [t.unknown()]);
-            const producers = types.flatMap((type, i) => (plan.contributes[i] ? [t.intersection([type])] : []));
-            const output = plan.hasRecursiveItems
-                ? recursiveArrayOutput(
-                      producers,
+            const parts = plan.hasRecursiveItems
+                ? recursiveArrayParts(
+                      types.map((type) => t.intersection([type])),
+                      (ctx.nonArrayOutputs ??= new WeakSet()),
                       (name) => {
                           const ref = ctx.resolver.resolveSchemaName(name)?.ref;
                           return ref ? t.intersection([branchType(ctx.resolver.getSchemaByRef(ref))]) : undefined;
-                      },
+                      }
+                  )
+                : undefined;
+            const output = parts
+                ? recursiveArrayOutput(
+                      parts.flatMap(({ arrays }, i) => (plan.outputContributors[i] ? [arrays] : [])),
                       !!options?.allReadonly
                   )
                 : arrayOutputType(
-                      producers.map((type) => builtinType("Extract", [type, array])),
-                      plan.presence,
+                      plan,
+                      (i) => t.intersection([types[i]!]),
                       (i) =>
                           emitTypescript({
                               schema: operands[i]!,
@@ -242,10 +277,9 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                               meta,
                               options,
                           }) as ts.TypeNode,
-                      !!options?.allReadonly,
-                      plan.unionProducers
+                      !!options?.allReadonly
                   );
-            if (plan.isArrayOnly) return output;
+            if (plan.isArrayOnly || parts?.some(({ other }) => !other)) return output;
             const nonArray = plan.isArrayOrNull
                 ? t.reference("null")
                 : t.union([
@@ -259,7 +293,11 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                           t.type("", { "[globalThis.Symbol.iterator]": t.optional(t.never()) }).type,
                       ]),
                   ]);
-            const other = plan.presence.some(Boolean) ? builtinType("Exclude", [all, array]) : all;
+            const other = parts
+                ? t.intersection(parts.map((part) => part.other!))
+                : plan.presence.some(Boolean)
+                ? builtinType("Exclude", [all, array])
+                : all;
             return t.union([output, t.intersection([other, nonArray])]);
         };
 
@@ -617,6 +655,20 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
     };
 
     let tsResult = getTs();
+
+    // A declared JSON object (including an empty or readonly object) cannot parse an
+    // array. The same TypeScript shape can also represent a broader guard, so retain
+    // this fact from the schema instead of guessing from its emitted object shape.
+    if (
+        ctx &&
+        !ctx.input &&
+        typeof tsResult === "object" &&
+        !isReferenceObject(schema) &&
+        ((schema.type && schema.type !== "array" && !(Array.isArray(schema.type) && schema.type.includes("array"))) ||
+            (schema.enum && !schema.enum.some(Array.isArray)))
+    ) {
+        (ctx.nonArrayOutputs ??= new WeakSet()).add(tsResult);
+    }
 
     // Add JSDoc comments
     if (options?.withDocs && !isReferenceObject(schema)) {

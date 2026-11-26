@@ -4,6 +4,7 @@ import { match } from "ts-pattern";
 import { arrayProjection, arrayProjectionCode } from "./arrayProjection";
 import type { CodeMetaData, ConversionTypeContext } from "./CodeMeta";
 import { CodeMeta } from "./CodeMeta";
+import { intersectionCode, intersectionMode } from "./intersectionCode";
 import { isReferenceObject } from "./isReferenceObject";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import { getZodChainableStringValidations, numberBounds } from "./scalarBounds";
@@ -241,7 +242,12 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             arrayProjection(operands, ctx?.resolver, isReferenceObject(schema), options);
         const parsers = operands.map(branchCode);
         const refs = projection ? parsers.map((_, i) => `member${i}`) : parsers;
+        const mergeMode = intersectionMode(
+            options?.schemaRefiner ? undefined : operands,
+            !!options?.allReadonly && !!ctx?.resolver.supportsSchemaRefSiblings
+        );
         let expression = refs[0]!;
+        const outputRefs = [refs[0]!];
         for (const [i, operand] of operands.slice(1).entries()) {
             const sibling: SchemaObject = { ...operand };
             const rule = refs[i + 1]!;
@@ -264,6 +270,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
                 continue;
             }
 
+            outputRefs.push(rule);
             const structuralTarget = ctx?.resolver.supportsSchemaRefSiblings
                 ? getSchemaReferenceChain(sibling, ctx.resolver).at(-1)!
                 : sibling;
@@ -273,7 +280,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
                 expression = `((base, rule) => z.custom<z.input<typeof base> & z.input<typeof rule>>(
                     (value) => z.getParsedType(value) !== z.ZodParsedType.object && rule.safeParse(value).success)
                     .pipe(base).refine((value): value is typeof value & z.output<typeof rule> => rule.safeParse(value).success)
-                    .or(base.and(rule)))(${expression}, ${rule})`;
+                    .or(${intersectionCode(["base", "rule"], mergeMode)}))(${expression}, ${rule})`;
                 continue;
             }
 
@@ -288,7 +295,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
                     sibling.enum ||
                     Object.hasOwn(sibling, "const"))
                     ? intersectTypeGuard(expression, rule)
-                    : `${expression}.and(${rule})`;
+                    : intersectionCode([expression, rule], mergeMode);
         }
 
         if (projection) {
@@ -296,7 +303,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             const array = arrayProjectionCode(
                 projection,
                 refs,
-                expression,
+                { parser: expression, outputs: outputRefs },
                 !!options?.allReadonly,
                 (branch, choice, index) => {
                     const parser = branchCode(branch);

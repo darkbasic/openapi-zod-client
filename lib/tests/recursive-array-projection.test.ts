@@ -22,6 +22,16 @@ const flags: SchemaObject = {
 };
 const limit = { maxItems: 10 };
 
+function parsers(source: string): Record<string, z.ZodTypeAny> {
+    const { outputText } = transpileModule(source, {
+        compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2020 },
+    });
+    return new Function("require", "exports", outputText + "\nreturn exports.schemas;")(
+        createRequire(import.meta.url),
+        {}
+    );
+}
+
 test.each([
     { explicit: false, readonly: false },
     { explicit: false, readonly: true },
@@ -58,14 +68,7 @@ test.each([
             options: { shouldExportAllSchemas: true, shouldExportAllTypes: explicit, allReadonly: readonly },
             disableWriteToFile: true,
         });
-        const { outputText } = transpileModule(source, {
-            compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2020 },
-        });
-        const client: Record<string, z.ZodTypeAny> = new Function(
-            "require",
-            "exports",
-            outputText + "\nreturn exports.schemas;"
-        )(createRequire(import.meta.url), {});
+        const client = parsers(source);
         expect(client.Tree!.parse([[{ label: "leaf", extra: true }]])).toEqual([[{ label: "leaf" }]]);
         expect(client.Tree!.safeParse([[], { label: "leaf" }]).success).toBe(false);
         expect(client.Mixed!.parse("leaf")).toBe("leaf");
@@ -111,6 +114,84 @@ const missing: z.output<typeof Merged> = [{ label: "leaf" }];
 const linked: z.output<typeof Indirect> = [{ child: [{ child: [] }] }];
 ${readonly ? "// @ts-expect-error the parsed array is readonly" : ""}
 Tree.parse([]).pop();
+`
+            )
+        ).toEqual([]);
+    },
+    30000
+);
+
+test.each([false, true])(
+    "recursive unions select whole array branches (readonly %s)",
+    async (readonly) => {
+        const label: SchemaObject = { type: "object", properties: { label: { type: "string" } } };
+        const amount: SchemaObject = { type: "object", properties: { amount: { type: "number" } } };
+        const field = (key: string, tag: number): SchemaObject => ({
+            type: "object",
+            properties: { [key]: { type: "string" }, tag: { enum: [tag] } },
+            required: [key],
+        });
+        const choices = (key: string, object: string, tag: number) => ({
+            anyOf: [...[0, 1, 2].map((i) => rows(field(key + i, i))), field(object, tag)],
+        });
+        const schemas = {
+            // An untyped items keyword also admits all non-array JSON values.
+            Branched: { allOf: [{ items: ref("Branched") }, { anyOf: [rows(label), amount, label] }] },
+            TwoArrays: { allOf: [{ items: ref("TwoArrays") }, { anyOf: [rows(label), rows(amount)] }] },
+            BranchBase: { anyOf: [rows(ref("BranchBase")), leaf] },
+            Checked: {
+                ...ref("BranchBase"),
+                allOf: [{ anyOf: [{ type: "array" }, { type: "object", additionalProperties: false }] }],
+                properties: { marker: { type: "string" } },
+                required: ["marker"],
+            },
+            Correlated: {
+                allOf: [{ items: ref("Correlated") }, choices("a", "left", 8), choices("b", "right", 9)],
+            },
+        };
+        const source = await generateZodClientFromOpenAPI({
+            openApiDoc: {
+                openapi: "3.1.0",
+                info: { title: "Recursive alternatives", version: "1" },
+                paths: {},
+                components: { schemas },
+            },
+            options: { shouldExportAllSchemas: true, allReadonly: readonly },
+            disableWriteToFile: true,
+        });
+        const client = parsers(source);
+        expect(client.Checked!.parse({ label: "L", marker: "present" })).toEqual({ label: "L" });
+        expect(client.Checked!.safeParse({ label: "L" }).success).toBe(false);
+        const mixed = [
+            { left: "L", right: "R", a0: "A", b0: "B" },
+            { left: "L", right: "R", a1: "A", b0: "B" },
+        ];
+        expect(client.Correlated!.safeParse(mixed).success).toBe(false);
+        expect(client.Correlated!.parse([mixed[0]])).toEqual([mixed[0]]);
+        expect(
+            typeErrors(
+                source +
+                    `
+const label: z.output<typeof Branched> = { label: "L" };
+const amount: z.output<typeof Branched> = { amount: 3 };
+const nested: z.output<typeof Branched> = [{ label: "L" }];
+// @ts-expect-error the object alternatives preserve their property types
+const badLeaf: z.output<typeof Branched> = { label: false, amount: "wrong" };
+const empty: z.output<typeof TwoArrays> = [];
+// @ts-expect-error the union only has array alternatives
+const object: z.output<typeof TwoArrays> = { label: "L" };
+// The reference sibling checks the raw marker, and the base strips it.
+const checked: z.output<typeof Checked> = { label: "L" };
+const checkedTree: z.output<typeof Checked> = [{ label: "L" }];
+const base = { left: "L", right: "R" };
+const first: z.output<typeof Correlated> = [{ ...base, a0: "A", b0: "B" }];
+const second: z.output<typeof Correlated> = [{ ...base, a1: "A", b2: "B" }];
+// @ts-expect-error the first producer chooses one branch for the entire array
+const mixedFirst: z.output<typeof Correlated> = [{ ...base, a0: "A", b0: "B" }, { ...base, a1: "A", b0: "B" }];
+// @ts-expect-error the second producer chooses one branch for the entire array
+const mixedSecond: z.output<typeof Correlated> = [{ ...base, a0: "A", b0: "B" }, { ...base, a0: "A", b1: "B" }];
+// @ts-expect-error inputs also have to satisfy one complete branch per producer
+const badInput: z.input<typeof Correlated> = [{ ...base, a0: "A", b0: "B" }, { ...base, a0: "A", b1: "B" }];
 `
             )
         ).toEqual([]);

@@ -751,6 +751,14 @@ export const hasStructuralLiteral = (schema: SchemaAssertions) =>
         (value) => value !== null && typeof value === "object"
     );
 
+// OpenAPI binary strings parse to File objects. Ordinary scalar intersections can
+// use Zod's native merge because they never allocate a container.
+export function hasOnlyScalarOutputs(schema: SchemaObject & { const?: unknown }): boolean {
+    if (schema.format === "binary") return false;
+    if (schema.enum || Object.hasOwn(schema, "const")) return !hasStructuralLiteral(schema);
+    return !!schema.type && (Array.isArray(schema.type) ? schema.type : [schema.type]).every(isPrimitiveType);
+}
+
 // Finite JSON values select their own applicable structural rules. A parser can still add
 // defaults or strip fields, so keep the exact literal output only when its shape is preserved.
 export function finiteStructuralAlternatives(

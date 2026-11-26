@@ -1,16 +1,20 @@
 import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t, ts } from "tanu";
 
+import { projectMergedItem } from "./arrayItemMerge";
+import type { Projection } from "./arrayProjection";
 import { literalType } from "./literalType";
 import type { DocumentResolver } from "./makeSchemaResolver";
 import { positiveDoubleNegation, requiredAdditionalKeys } from "./schemaAssertions";
 
 type Schema = ReferenceObject | SchemaObject;
+export type ItemRole = "guard" | "producer" | "possible";
 
 // Locate item contracts that can narrow a parsed result. The generated input and
 // output types decide whether each constraint applies, including across unions.
 type Presence = {
     keys: string[];
+    possibleKeys: true | string[];
     hasScalarConstraint: boolean;
     tuples: unknown[][];
     items?: Presence | undefined;
@@ -24,6 +28,9 @@ function merge(nodes: Presence[]): Presence | undefined {
     if (nodes.length <= 1) return nodes[0];
     return {
         keys: [...new Set(nodes.flatMap((node) => node.keys))],
+        possibleKeys: nodes.some((node) => node.possibleKeys === true)
+            ? true
+            : [...new Set(nodes.flatMap((node) => (node.possibleKeys === true ? [] : node.possibleKeys)))],
         hasScalarConstraint: nodes.some((node) => node.hasScalarConstraint),
         tuples: [...new Set(nodes.flatMap((node) => node.tuples))],
         items: merge(nodes.flatMap((node) => node.items ?? [])),
@@ -32,30 +39,49 @@ function merge(nodes: Presence[]): Presence | undefined {
 
 function localPresence(
     schema: SchemaObject & { const?: unknown },
-    isAssertion: boolean,
+    role: ItemRole,
+    additionalDefault: boolean,
     items: Presence | undefined
 ): Presence | undefined {
+    const isAssertion = role !== "producer";
     const keys = (isAssertion ? schema.required ?? [] : requiredAdditionalKeys(schema)).filter(
         (key) => key !== "__proto__"
     );
     const literals = Object.hasOwn(schema, "const") ? [schema.const] : schema.enum;
     const hasScalarConstraint = isAssertion && (!!schema.type || !!literals);
-    if (keys.length === 0 && !hasScalarConstraint && !items) return;
+    const declared =
+        role === "possible" ? Object.keys(schema.properties ?? {}).filter((key) => key !== "__proto__") : [];
+    const additional = schema.additionalProperties ?? additionalDefault;
+    const hasIndex =
+        role === "possible" &&
+        !!additional &&
+        (declared.length > 0 || (typeof additional === "object" && Object.keys(additional).length > 0));
+    const possibleKeys = hasIndex || declared;
+    if (keys.length === 0 && !hasIndex && declared.length === 0 && !hasScalarConstraint && !items) return;
     return {
         keys,
+        possibleKeys,
         hasScalarConstraint,
         items,
         tuples: isAssertion ? literals?.filter(Array.isArray) ?? [] : [],
     };
 }
 
-export function arrayPresenceCandidates(operands: Schema[], contributes: boolean[], resolver: DocumentResolver) {
-    const guards = new Map<Schema, Presence | undefined>();
-    const producers = new Map<Schema, Presence | undefined>();
+export function arrayPresenceCandidates(
+    operands: Schema[],
+    roles: ItemRole[],
+    resolver: DocumentResolver,
+    additionalDefault: boolean
+) {
+    const cacheByRole = {
+        guard: new Map<Schema, Presence | undefined>(),
+        producer: new Map<Schema, Presence | undefined>(),
+        possible: new Map<Schema, Presence | undefined>(),
+    };
     const visiting = new Set<Schema>();
     let hasRecursiveItems = false;
-    const visit = (schema: Schema, isGuard: boolean): Presence | undefined => {
-        const cache = isGuard ? guards : producers;
+    const visit = (schema: Schema, role: ItemRole): Presence | undefined => {
+        const cache = cacheByRole[role];
         if (cache.has(schema)) return cache.get(schema);
         if (visiting.has(schema)) {
             hasRecursiveItems = true;
@@ -68,21 +94,18 @@ export function arrayPresenceCandidates(operands: Schema[], contributes: boolean
         };
         // A producer already types its declared properties. A reference sibling
         // checks the raw input and can supply an independent presence guarantee.
-        const isAssertion = isGuard || !!$ref;
-        const proof = localPresence(local, isAssertion, items && visit(items, isAssertion));
+        const localRole = $ref ? "guard" : role;
+        const proof = localPresence(local, localRole, additionalDefault, items && visit(items, localRole));
         const ref = $ref && resolver.getSchemaByRef($ref);
         const branches = [...(allOf ?? []), ...(anyOf ?? []), ...(oneOf ?? []), ...(ref ? [ref] : [])];
-        const result = merge([
-            ...(proof ? [proof] : []),
-            ...branches.flatMap((branch) => visit(branch, isGuard) ?? []),
-        ]);
+        const result = merge([...(proof ? [proof] : []), ...branches.flatMap((branch) => visit(branch, role) ?? [])]);
         visiting.delete(schema);
         cache.set(schema, result);
         return result;
     };
 
     const candidates = operands.map((operand, i) => {
-        const proof = visit(operand, !contributes[i]);
+        const proof = visit(operand, roles[i]!);
         return proof?.tuples.length || proof?.items ? proof : undefined;
     });
     // TypeScript rejects conditional types over their own array element alias.
@@ -109,7 +132,7 @@ const present = t.union([f.createTypeLiteralNode([]), t.reference("null")]);
 // A guard can narrow a retained field's presence, never replace its parsed type.
 // Work from the actual input type: a default, an unchecked schema, or a union
 // accepting a missing key does not prove that the caller supplied it.
-type ItemGuard = { input: ts.TypeNode; proof: Presence };
+type ItemGuard = { input: ts.TypeNode; proof: Presence; output?: ts.TypeNode | undefined };
 
 function presentFields(item: ts.TypeNode, input: ts.TypeNode, names: string[], readonly: boolean) {
     const key = t.reference("Key");
@@ -165,15 +188,50 @@ function applyPresence(value: ts.TypeNode, guards: ItemGuard[], readonly: boolea
     const scalars = guards.flatMap(({ proof }, i) =>
         proof.hasScalarConstraint ? [scalarConstraint(t.reference(names[i]!))] : []
     );
-    const fields = guards.flatMap(({ proof }, i) =>
+    const bindings = guards.flatMap(({ input, output }, i) => [
+        { name: names[i]!, type: input },
+        ...(output ? [{ name: "Output" + i, type: output }] : []),
+    ]);
+    const fields: ts.TypeNode[] = guards.flatMap(({ proof }, i) =>
         proof.keys.length > 0 ? [presentFields(item, t.reference(names[i]!), proof.keys, readonly)] : []
     );
+    for (const [i, { proof, output }] of guards.entries()) {
+        if (!output || (proof.possibleKeys !== true && proof.possibleKeys.length === 0)) continue;
+        // A selected dictionary can add arbitrary keys. Other producers can
+        // materialize fields outside its value type, e.g. a string default.
+        if (proof.possibleKeys === true) {
+            const open = t.reference("globalThis.Record", [t.string(), t.unknown()]);
+            fields.push(
+                t.union([f.createTypeLiteralNode([]), readonly ? t.reference("globalThis.Readonly", [open]) : open])
+            );
+            continue;
+        }
+
+        // Keep the original row as an alternative and exclude keys that occur solely in a raw assertion.
+        const part = t.reference("Part");
+        const keys = t.union(proof.possibleKeys.map(literalType));
+        const picked = t.reference("globalThis.Pick", [part, t.intersection([keyof(part), keys])]);
+        const possible = conditional(
+            t.reference("Output" + i),
+            f.createInferTypeNode(param("Part")),
+            conditional(part, t.reference("object"), picked, t.never()),
+            t.never()
+        );
+        fields.push(t.union([f.createTypeLiteralNode([]), possible]));
+    }
+
     const object =
         fields.length > 0 ? conditional(item, t.reference("object"), t.intersection([item, ...fields]), item) : item;
-    const children = guards.flatMap(({ proof }, i) => {
+    const children = guards.flatMap(({ proof, output }, i) => {
         const input = t.reference(names[i]!);
         return proof.items
-            ? [{ proof: proof.items, input: conditional(t.undefined(), input, t.unknown(), elements(input)) }]
+            ? [
+                  {
+                      proof: proof.items,
+                      input: conditional(t.undefined(), input, t.unknown(), elements(input)),
+                      output: output && elements(t.reference("Output" + i)),
+                  },
+              ]
             : [];
     });
     // Rebuild array methods from the same element type used for indexing.
@@ -190,8 +248,10 @@ function applyPresence(value: ts.TypeNode, guards: ItemGuard[], readonly: boolea
     // Bind the inputs outside the conditional. Each operand appears once per
     // level and component names cannot be captured by the local type parameters.
     return conditional(
-        f.createTupleTypeNode([value, ...guards.map(({ input }) => input)]),
-        f.createTupleTypeNode(["Item", ...names].map((name) => f.createInferTypeNode(param(name)))),
+        f.createTupleTypeNode([value, ...bindings.map(({ type }) => type)]),
+        f.createTupleTypeNode(
+            ["Item", ...bindings.map(({ name }) => name)].map((name) => f.createInferTypeNode(param(name)))
+        ),
         t.intersection([conditional(item, array, nested, object), ...scalars]),
         t.never()
     );
@@ -281,7 +341,13 @@ function tupleProjection(parsed: ts.TypeNode, raw: ts.TypeNode, proof: Presence,
     );
 }
 
-function preserveArrayUnions(parsed: ts.TypeNode, unions: ts.TypeNode[], readonly: boolean) {
+function preserveArrayUnions(
+    parsed: ts.TypeNode,
+    unions: ts.TypeNode[],
+    readonly: boolean,
+    recursive: boolean,
+    project: (item: ts.TypeNode) => ts.TypeNode
+) {
     if (unions.length === 0) return parsed;
     // A whole-array union selects one branch for every position. Keep each
     // producer's correlation independently, reusing the merged item type.
@@ -290,9 +356,13 @@ function preserveArrayUnions(parsed: ts.TypeNode, unions: ts.TypeNode[], readonl
     const names = unions.map((_, i) => "Part" + i);
     const constraints = names.map((name) => {
         const part = t.reference(name);
-        const list = t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [
-            t.intersection([item(value), item(part)]),
-        ]);
+        // The shared list already types the methods. In a recursive union constrain
+        // just the index (or the fixed tuple) to avoid duplicating its full element type.
+        const list = recursive
+            ? conditional(t.number(), lengthOf(part), t.type("", { "readonly [index: number]": item(part) }).type, part)
+            : t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [
+                  project(t.intersection([item(value), item(part)])),
+              ]);
         return conditional(part, array, list, t.never());
     });
     return conditional(
@@ -304,19 +374,31 @@ function preserveArrayUnions(parsed: ts.TypeNode, unions: ts.TypeNode[], readonl
 }
 
 export function arrayOutputType(
-    producers: ts.TypeNode[],
-    candidates: Array<Presence | undefined>,
+    plan: Projection,
+    parsedArray: (index: number) => ts.TypeNode,
     rawArray: (index: number) => ts.TypeNode,
-    readonly: boolean,
-    unionProducers: boolean[]
+    readonly: boolean
 ): ts.TypeNode {
-    if (producers.length === 1 && !candidates.some(Boolean)) return producers[0]!;
+    const { presence: candidates, unionProducers, hasRecursiveItems } = plan;
+    const producers = plan.outputContributors.flatMap((owned, i) =>
+        owned ? [t.reference("globalThis.Extract", [parsedArray(i), array])] : []
+    );
+    if (producers.length === 1 && !candidates.some(Boolean) && !plan.mergedItems) return producers[0]!;
     const items = producers.map((producer) => f.createIndexedAccessTypeNode(producer, t.number()));
     const item: ts.TypeNode = items.length > 0 ? t.intersection(items) : t.unknown();
     const guards = candidates.flatMap((proof, i) =>
-        proof?.items ? [{ proof: proof.items, input: elements(rawArray(i)) }] : []
+        proof?.items
+            ? [
+                  {
+                      proof: proof.items,
+                      input: elements(rawArray(i)),
+                      output: plan.roles[i] === "possible" ? elements(parsedArray(i)) : undefined,
+                  },
+              ]
+            : []
     );
-    const parsedItem = guards.length > 0 ? applyPresence(item, guards, readonly) : item;
+    const project = (row: ts.TypeNode) => (plan.mergedItems ? projectMergedItem(row, plan.mergedItems, readonly) : row);
+    const parsedItem = project(guards.length > 0 ? applyPresence(item, guards, readonly) : item);
     const list = t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [parsedItem]);
     // Intersecting a fixed tuple with the narrowed element list preserves its
     // length and positional types while array methods use the narrowed elements.
@@ -337,6 +419,8 @@ export function arrayOutputType(
     return preserveArrayUnions(
         output,
         producers.filter((_, i) => unionProducers[i]),
-        readonly
+        readonly,
+        hasRecursiveItems,
+        project
     );
 }

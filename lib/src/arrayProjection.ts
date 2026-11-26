@@ -1,10 +1,17 @@
 import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t } from "tanu";
 
-import { arrayOutputType, arrayPresenceCandidates } from "./arrayItemPresence";
+import { arrayItemMergePlan } from "./arrayItemMerge";
+import { type ItemRole, arrayOutputType, arrayPresenceCandidates } from "./arrayItemPresence";
+import { intersectionCode, restoreMergedReadonly } from "./intersectionCode";
 import type { DocumentResolver } from "./makeSchemaResolver";
 import { printTs } from "./printTs";
-import { getConjunctiveSchemaLayers, hasStructuralKeywords, positiveDoubleNegation } from "./schemaAssertions";
+import {
+    getConjunctiveSchemaLayers,
+    hasOnlyScalarOutputs,
+    hasStructuralKeywords,
+    positiveDoubleNegation,
+} from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
 
 type Schema = ReferenceObject | SchemaObject;
@@ -64,12 +71,26 @@ function objectDecision(schema: SchemaObject, options?: TemplateContext["options
     return schema.type === "object" ? true : "object";
 }
 
+// JSON scalars survive a merge unchanged. Composite values must be owned by the
+// parser, including array elements. A binary string uses a File object at runtime.
+function coversItemOutput(schema: SchemaObject, object: Decision, item: Decision) {
+    if (hasOnlyScalarOutputs(schema)) return true;
+    const types = Array.isArray(schema.type) ? schema.type : schema.type && [schema.type];
+    return types?.every(
+        (kind) =>
+            (kind !== "object" || object !== false) &&
+            (kind !== "array" || item === true) &&
+            (kind !== "string" || schema.format !== "binary")
+    );
+}
+
 function memberDecision(
     schema: Schema,
     scope: Scope,
     visit: (member: Schema, scope: Scope) => Decision,
     resolver: DocumentResolver,
-    options?: TemplateContext["options"]
+    options: TemplateContext["options"],
+    forOutput: boolean
 ): Decision {
     const { $ref, allOf, anyOf, oneOf, ...local }: SchemaObject & { $ref?: string } = {
         ...(positiveDoubleNegation(schema) ?? schema),
@@ -81,13 +102,15 @@ function memberDecision(
         const target = resolver.getSchemaByRef($ref);
         decisions.push(target ? visit(target, scope) : true);
     } else {
-        if (scope === "item") decisions.push(objectDecision(local, options));
-
-        if (local.items) {
-            const item = visit(local.items, "item");
-            if (item !== false)
-                decisions.push(scope === "array" || (local.type === "array" && item === true) ? item : { items: item });
+        const item = local.items ? visit(local.items, "item") : false;
+        if (scope === "item") {
+            const object = objectDecision(local, options);
+            decisions.push(object);
+            if (forOutput && coversItemOutput(local, object, item)) decisions.push(true);
         }
+
+        if (item !== false)
+            decisions.push(scope === "array" || (local.type === "array" && item === true) ? item : { items: item });
     }
 
     if (allOf) decisions.push(...allOf.map((member) => visit(member, scope)));
@@ -97,7 +120,7 @@ function memberDecision(
     return combine(decisions);
 }
 
-function ownershipVisitor(resolver: DocumentResolver, options?: TemplateContext["options"]) {
+function ownershipVisitor(resolver: DocumentResolver, options: TemplateContext["options"], forOutput = false) {
     const complete = { array: new Map<Schema, Decision>(), item: new Map<Schema, Decision>() };
     const visiting = {
         array: new Map<Schema, { recursive: Decision }>(),
@@ -108,7 +131,7 @@ function ownershipVisitor(resolver: DocumentResolver, options?: TemplateContext[
         if (cached !== undefined) return cached;
         const recursive: { recursive: Decision } = { recursive: false };
         visiting[scope].set(schema, recursive);
-        const decision = memberDecision(schema, scope, visit, resolver, options);
+        const decision = memberDecision(schema, scope, visit, resolver, options, forOutput);
         recursive.recursive = decision;
         visiting[scope].delete(schema);
         complete[scope].set(schema, decision);
@@ -136,6 +159,14 @@ export function arrayProjection(
     if (producers.length === 0) return;
     const isDynamic = producers.length > 1 && producers.some((decision) => typeof decision !== "boolean");
     const contributes = decisions.map((decision) => (isDynamic ? decision === true : decision !== false));
+    const output = ownershipVisitor(resolver, options, true);
+    const outputContributors = decisions.map(
+        (decision, i) => contributes[i] || (decision !== false && output(operands[i]!, "array") === true)
+    );
+    const roles = decisions.map((decision, i): ItemRole => {
+        if (contributes[i]) return "producer";
+        return decision !== false && !outputContributors[i] ? "possible" : "guard";
+    });
     const isArrayOnly = members.some((layers) =>
         layers?.some(
             (layer) =>
@@ -154,7 +185,7 @@ export function arrayProjection(
     // Only a union at the array level selects a branch for the entire list.
     // Alternatives inside items are already represented by the element type.
     const unionProducers = members
-        .filter((_, i) => contributes[i])
+        .filter((_, i) => outputContributors[i])
         .map(
             (layers) =>
                 !layers ||
@@ -162,10 +193,22 @@ export function arrayProjection(
                     (layer) => layer.anyOf ?? layer.oneOf ?? (layer.enum?.filter(Array.isArray).length ?? 0) > 1
                 )
         );
-    const presence = arrayPresenceCandidates(operands, contributes, resolver);
+    const presence = arrayPresenceCandidates(
+        operands,
+        roles,
+        resolver,
+        options?.additionalPropertiesDefaultValue !== false
+    );
     return {
         decisions,
+        mergedItems: arrayItemMergePlan(
+            operands.filter((_, i) => decisions[i] !== false),
+            resolver,
+            options?.withDefaultValues !== false
+        ),
         contributes,
+        roles,
+        outputContributors,
         isDynamic,
         isArrayOnly,
         isArrayOrNull,
@@ -175,17 +218,7 @@ export function arrayProjection(
     };
 }
 
-type Projection = NonNullable<ReturnType<typeof arrayProjection>>;
-
-// Zod allocates unfrozen composites when merging parsed arrays. Passthrough values still
-// belong to the caller, so stop at any subtree shared with the original input.
-const freezeMerged = `const freezeValue = z.unknown().readonly();
-    const object = (value: unknown): value is { [key: string]: unknown } => !!value && typeof value === "object";
-    const freeze = (value: unknown, raw: unknown) => {
-        if (!object(value) || value === raw) return;
-        freezeValue.parse(value);
-        for (const key of z.util.objectKeys(value)) freeze(value[key], object(raw) ? raw[key] : undefined);
-    };`;
+export type Projection = NonNullable<ReturnType<typeof arrayProjection>>;
 
 function arraySelectors(plan: Projection, emit: Emit) {
     const rules: string[] = [];
@@ -262,6 +295,7 @@ function selectedArray(plan: Projection, refs: string[], emit: Emit, readonly: b
             ${combineMasks}
             ${arrayChecks.join("\n")}
             ${selectors.join("\n")}
+            ${readonly ? restoreMergedReadonly : ""}
             type Piece = { data: unknown; mask: Mask };
             const keep = (piece: Piece): z.ZodType<unknown> => z.unknown().transform(() => piece.data);
             const merge = (item: unknown, parts: Piece[], path: number[]): unknown => {
@@ -276,23 +310,31 @@ function selectedArray(plan: Projection, refs: string[], emit: Emit, readonly: b
                             mask: typeof mask === "function" ? mask(item[i]) : mask,
                         })), [...path, i]));
                     }
+                    ${readonly ? "restore(values, item, owned.map(part => part.data), false);" : ""}
                     return values;
                 }
                 const merged = owned.map(keep).reduce((a, b) => a.and(b)).safeParse(undefined);
-                if (merged.success) return merged.data;
+                if (merged.success) {
+                    ${readonly ? "restore(merged.data, item, owned.map(part => part.data));" : ""}
+                    return merged.data;
+                }
                 ctx.addIssue({ code: "invalid_intersection_types", path });
                 return z.NEVER;
             };
             const owners = [${owners.join(", ")}];
-            const result = merge(value, parsed.map((data, i) => ({ data, mask: owners[i]! })), []);
-            ${readonly ? freezeMerged + "\nfreeze(result, value);" : ""}
-            return result;
+            return merge(value, parsed.map((data, i) => ({ data, mask: owners[i]! })), []);
         })`;
     const names = rules.map((_, i) => "option" + i);
     return rules.length > 0 ? `((${names.join(", ")}) => ${parse})(${rules.join(", ")})` : parse;
 }
 
-export function arrayProjectionCode(plan: Projection, refs: string[], other: string, readonly: boolean, emit: Emit) {
+export function arrayProjectionCode(
+    plan: Projection,
+    refs: string[],
+    other: { parser: string; outputs: string[] },
+    readonly: boolean,
+    emit: Emit
+) {
     const producers = refs.filter((_, i) => plan.contributes[i]);
     const input = refs.map((ref) => `z.input<typeof ${ref}>`).join(" & ");
     const isArray = "z.getParsedType(value) === z.ZodParsedType.array";
@@ -301,49 +343,33 @@ export function arrayProjectionCode(plan: Projection, refs: string[], other: str
         array = selectedArray(plan, refs, emit, readonly);
     } else {
         const guards = refs.filter((_, i) => !plan.contributes[i]);
-        const parser = producers.reduce((left, right) => `${left}.and(${right})`);
-        const shouldFreeze = readonly && producers.length > 1;
-        // Run guards as native intersections. Their empty outputs cannot restore
-        // stripped fields; Zod retains nested issue paths and the caller's error map.
-        let validated = shouldFreeze ? "z.unknown().transform(raw => ({ raw }))" : "";
-        for (const guard of guards) {
-            const empty = `${guard}.transform(() => ({}))`;
-            validated = validated ? `${validated}.and(${empty})` : empty;
-        }
-
-        array =
-            arrayInput(refs) +
-            ".pipe(" +
-            (validated
-                ? `${validated}.and(${parser}.transform(data => ({ data }))).transform(parts => {
-                ${shouldFreeze ? freezeMerged + "\nfreeze(parts.data, parts.raw);" : ""}
-                return parts.data;
-            })`
-                : parser) +
-            ")";
+        array = `${arrayInput(refs)}.pipe(${intersectionCode(
+            producers,
+            readonly ? "preserve-readonly" : "native",
+            guards
+        )})`;
     }
 
-    const outputs = producers.map((ref) =>
-        t.reference(`globalThis.Extract<z.output<typeof ${ref}>, readonly unknown[]>`)
-    );
     const output = printTs(
         arrayOutputType(
-            outputs,
-            plan.presence,
+            plan,
+            (i) => t.reference(`z.output<typeof ${refs[i]}>`),
             (i) => t.reference(`z.input<typeof ${refs[i]}>`),
-            readonly,
-            plan.unionProducers
+            readonly
         )
     );
-    // Only narrow successful parses: a failed transform may carry an internal
-    // intermediate value, which must not produce another validation issue.
-    array = `((parser) => parser.pipe(z.custom<z.output<typeof parser>>().refine((value): value is ${output} =>
-        ${isArray})))(${array})`;
-    const otherType = plan.presence.some(Boolean)
+    // Validate the projected array after all operands succeed. Native intersections can
+    // describe a narrower dictionary than the result when another parser inserts a field.
+    array = `${array}.pipe(z.custom<${output}>(value => ${isArray}, { fatal: false }))`;
+    // Exclude array alternatives before intersecting recursive unions. Intersecting
+    // first leaves impossible array/object combinations for TypeScript to compare.
+    const otherType = plan.hasRecursiveItems
+        ? other.outputs.map((ref) => `globalThis.Exclude<z.output<typeof ${ref}>, readonly unknown[]>`).join(" & ")
+        : plan.presence.some(Boolean)
         ? "globalThis.Exclude<typeof value, readonly unknown[]>"
         : "typeof value";
     return plan.isArrayOnly
         ? array
-        : `${array}.or(z.custom<${input}>((value) => !(${isArray})).pipe(${other})
+        : `${array}.or(z.custom<${input}>((value) => !(${isArray})).pipe(${other.parser})
         .refine((value): value is ${otherType} & (string | number | boolean | null | undefined | (object & { [globalThis.Symbol.iterator]?: never })) => !(${isArray})))`;
 }
