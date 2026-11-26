@@ -327,6 +327,9 @@ importers:
       '@typescript-eslint/parser':
         specifier: ^5.40.1
         version: 5.43.0(eslint@8.27.0(supports-color@7.2.0))(supports-color@7.2.0)(typescript@5.1.6)
+      ajv:
+        specifier: 8.20.0
+        version: 8.20.0
       degit:
         specifier: ^2.8.6
         version: 2.8.6

@@ -1,6 +1,7 @@
 import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { match } from "ts-pattern";
 
+import { arrayProjection, arrayProjectionCode } from "./arrayProjection";
 import type { CodeMetaData, ConversionTypeContext } from "./CodeMeta";
 import { CodeMeta } from "./CodeMeta";
 import { isReferenceObject } from "./isReferenceObject";
@@ -168,7 +169,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
         ? normalizeBooleanSchema(options.schemaRefiner($schema, inheritedMeta) ?? $schema)
         : $schema;
     const conditional = lowerStructuralConditional(schema, ctx?.resolver);
-    const negated = conditional ? undefined : schemaNegation(schema, ctx?.resolver);
+    const negated = conditional ? undefined : schemaNegation(schema, ctx?.resolver, options);
     const parts = negated ? undefined : schemaAssertionParts(schema, ctx?.resolver);
     // A reference with siblings is a composition. Only its actual reference operand enters the recursion stack.
     const expressionSchema = conditional
@@ -218,10 +219,16 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
     if (conjunction) {
         if (conjunction.length === 0) return code.assign("z.unknown()");
         const operands = intersectionOperands(conjunction, ctx?.resolver, !parts && !options?.schemaRefiner);
-        let expression = branchCode(operands[0]!);
-        for (const operand of operands.slice(1)) {
+        const projection =
+            !options?.schemaRefiner &&
+            (!parts || "allOf" in schema) &&
+            arrayProjection(operands, ctx?.resolver, isReferenceObject(schema), options);
+        const parsers = operands.map(branchCode);
+        const refs = projection ? parsers.map((_, i) => `member${i}`) : parsers;
+        let expression = refs[0]!;
+        for (const [i, operand] of operands.slice(1).entries()) {
             const sibling: SchemaObject = { ...operand };
-            const rule = branchCode(sibling);
+            const rule = refs[i + 1]!;
             if (hasStructuralLiteral(sibling) || (isReferenceObject(schema) && hasStructuralKeywords(sibling))) {
                 expression = guardInput(expression, rule);
                 continue;
@@ -266,6 +273,11 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
                     Object.hasOwn(sibling, "const"))
                     ? intersectTypeGuard(expression, rule)
                     : `${expression}.and(${rule})`;
+        }
+
+        if (projection) {
+            const array = arrayProjectionCode(projection, refs, expression, !!options?.allReadonly, branchCode);
+            return code.assign(`((${refs.join(", ")}) => ${array})(${parsers.join(", ")})`);
         }
 
         return code.assign(expression);
@@ -385,7 +397,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
         }
 
         const union = `z.union([${types.join(", ")}])`;
-        const overlaps = options?.schemaRefiner ? [] : structuralOneOfOverlaps(schema.oneOf, ctx?.resolver);
+        const overlaps = structuralOneOfOverlaps(schema.oneOf, ctx?.resolver, options);
         return assignComposition(guardStructuralOneOf(union, overlaps));
     }
 

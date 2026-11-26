@@ -256,14 +256,16 @@ const keywordDomains = new Map(
 
 // A reference and its siblings are a conjunction in 3.1. A composition with one option
 // also asserts that option, irrespective of the composition keyword.
-function getConjunctiveSchemaLayers(
+export function getConjunctiveSchemaLayers(
     schema: Schema,
     resolver: ConditionalResolver,
     flattenAllOf = false
 ): SchemaObject[] | undefined {
     const layers: SchemaObject[] = [];
     const active = new Set<string>();
+    const complete = new Set<Schema>();
     const visit = (branch: Schema): boolean => {
+        if (complete.has(branch)) return true;
         const { $ref, ...siblings }: SchemaAssertions = { ...branch };
         const applicable: SchemaObject = $ref && !resolver.supportsSchemaRefSiblings ? {} : siblings;
         const { oneOf, anyOf, allOf, ...assertions } = applicable;
@@ -286,17 +288,12 @@ function getConjunctiveSchemaLayers(
             active.delete($ref);
         }
 
-        return children.every(visit);
+        if (!children.every(visit)) return false;
+        complete.add(branch);
+        return true;
     };
 
     return visit(schema) ? layers : undefined;
-}
-
-function canCheckArrayItems(items: Schema | undefined, resolver: DocumentResolver) {
-    const layers = items && getConjunctiveSchemaLayers(items, resolver);
-    return layers?.every((schema) =>
-        Object.keys(schema).every((key) => nonAssertionKeys.has(key) || canProveKeyword(schema, key))
-    );
 }
 
 function canProveKeyword(schema: SchemaObject, key: string) {
@@ -306,11 +303,68 @@ function canProveKeyword(schema: SchemaObject, key: string) {
     );
 }
 
+// Only use a generated parser as an assertion on raw JSON when all applicable keywords
+// have exact input semantics. In particular, object parsing may fill a required default
+// or strip forbidden keys. A successful parse then cannot prove the object was valid.
+function hasExactRawParser(
+    schema: Schema,
+    resolver: DocumentResolver,
+    options?: TemplateContext["options"],
+    refs = new Map<string, boolean>()
+): boolean {
+    if (options?.schemaRefiner) return false;
+    const { $ref, allOf, anyOf, oneOf, not, ...local }: SchemaAssertions = { ...schema };
+    const visit = (child: Schema) => hasExactRawParser(child, resolver, options, refs);
+    if ($ref) {
+        if (!refs.has($ref)) {
+            refs.set($ref, false);
+            const target = resolver.getSchemaByRef($ref);
+            if (target) refs.set($ref, visit(target));
+        }
+
+        if (!refs.get($ref)) return false;
+        if (!resolver.supportsSchemaRefSiblings) return true;
+    }
+
+    // The ordinary union does not enforce general oneOf exclusivity.
+    if (oneOf && oneOf.length !== 1) return false;
+    const children = [...(allOf ?? []), ...(anyOf ?? []), ...(oneOf ?? [])];
+    if (not) children.push(not);
+    return children.every(visit) && hasExactLocalParser(local, visit, options);
+}
+
+function hasExactLocalParser(
+    local: SchemaObject,
+    visit: (schema: Schema) => boolean,
+    options?: TemplateContext["options"]
+) {
+    const types = Array.isArray(local.type) ? local.type : local.type ? [local.type] : [];
+    // A closed strict default rejects extra keys even when the schema permits them.
+    if (
+        options?.strictObjects &&
+        options.additionalPropertiesDefaultValue === false &&
+        (types.includes("object") || isUntypedStructural(local))
+    )
+        return false;
+    return Object.keys(local).every((key) => {
+        if (nonAssertionKeys.has(key) || key.startsWith("x-") || canProveKeyword(local, key)) return true;
+        const domain = keywordDomains.get(key);
+        if (domain && types.length > 0 && !types.some((type) => (type === "integer" ? "number" : type) === domain))
+            return true;
+        return key === "items" && !!local.items && visit(local.items);
+    });
+}
+
 // "check" means a successful raw parse proves a match. "never" also guarantees the
 // parser rejects the input, so that option cannot falsely make a containing union succeed.
 type KindMatch = "always" | "never" | "check" | "unknown";
 
-function localKindMatch(local: SchemaObject, kind: NonObjectKind, resolver: DocumentResolver): KindMatch {
+function localKindMatch(
+    local: SchemaObject,
+    kind: NonObjectKind,
+    resolver: DocumentResolver,
+    options?: TemplateContext["options"]
+): KindMatch {
     const types = Array.isArray(local.type) ? local.type : local.type ? [local.type] : [];
     const isRestricted = types.length > 0 && !types.includes(kind);
     if (isRestricted && (kind !== "number" || !types.includes("integer"))) return "never";
@@ -326,7 +380,9 @@ function localKindMatch(local: SchemaObject, kind: NonObjectKind, resolver: Docu
     });
     if (
         keys.some((key) =>
-            key === "items" ? !canCheckArrayItems(local.items, resolver) : !canProveKeyword(local, key)
+            key === "items"
+                ? !local.items || !hasExactRawParser(local.items, resolver, options)
+                : !canProveKeyword(local, key)
         )
     )
         return "unknown";
@@ -349,7 +405,12 @@ function alternativeMatch(matches: KindMatch[], exclusive: boolean): KindMatch {
     return possible.includes("unknown") ? "unknown" : "check";
 }
 
-function nonObjectMatch(branch: Schema, kind: NonObjectKind, resolver: DocumentResolver) {
+function nonObjectMatch(
+    branch: Schema,
+    kind: NonObjectKind,
+    resolver: DocumentResolver,
+    options?: TemplateContext["options"]
+) {
     const refs = new Map<string, KindMatch>();
     let hasStructural = false;
     const visit = (schema: Schema): KindMatch => {
@@ -361,13 +422,9 @@ function nonObjectMatch(branch: Schema, kind: NonObjectKind, resolver: DocumentR
 
         const { $ref, oneOf, anyOf, allOf, not, ...local }: SchemaAssertions = { ...schema };
         hasStructural ||= !local.type && hasStructuralKeywords(local);
-        const matches = [localKindMatch(local, kind, resolver)];
+        const matches = [localKindMatch(local, kind, resolver, options)];
         if (not) {
-            // A pure type negation is exact. The fractional side of an integer condition uses it.
-            const excluded =
-                !isReferenceObject(not) && not.type && Object.keys(not).length === 1
-                    ? localKindMatch(not, kind, resolver)
-                    : "unknown";
+            const excluded = hasExactRawParser(not, resolver, options) ? visit(not) : "unknown";
             matches.push(excluded === "always" ? "never" : excluded === "never" ? "always" : excluded);
         }
 
@@ -394,10 +451,14 @@ function nonObjectMatch(branch: Schema, kind: NonObjectKind, resolver: DocumentR
 
 // Untyped structural options also match values outside the domain of their keywords.
 // Keep the ordinary union on object inputs (its parsing policy includes defaults and stripping).
-export function structuralOneOfOverlaps(branches: Schema[], resolver?: DocumentResolver) {
-    if (!resolver?.supportsSchemaRefSiblings) return [];
+export function structuralOneOfOverlaps(
+    branches: Schema[],
+    resolver?: DocumentResolver,
+    options?: TemplateContext["options"]
+) {
+    if (!resolver?.supportsSchemaRefSiblings || options?.schemaRefiner) return [];
     return nonObjectKinds.flatMap((kind) => {
-        const matches = branches.map((branch) => nonObjectMatch(branch, kind, resolver));
+        const matches = branches.map((branch) => nonObjectMatch(branch, kind, resolver, options));
         if (!matches.some(({ hasStructural, match }) => hasStructural && (match === "always" || match === "check")))
             return [];
         const always = matches.filter(({ match }) => match === "always").length;
@@ -414,7 +475,7 @@ export function structuralOneOfDomain(overlaps: ReturnType<typeof structuralOneO
     return { allowsArrays: !excluded.has("array"), scalars: scalarKinds.filter((kind) => !excluded.has(kind)) };
 }
 
-export function schemaNegation(schema: Schema, resolver?: DocumentResolver) {
+export function schemaNegation(schema: Schema, resolver?: DocumentResolver, options?: TemplateContext["options"]) {
     const local: SchemaAssertions = { ...schema };
     if (
         resolver?.supportsSchemaRefSiblings &&
@@ -447,7 +508,13 @@ export function schemaNegation(schema: Schema, resolver?: DocumentResolver) {
             .flatMap((layer) => Object.keys(layer))
             .filter((key) => !nonAssertionKeys.has(key) && !key.startsWith("x-"));
         if (keys.length === 0) return { positive: { enum: [] } };
-        if (keys.every((key) => exactNegationKeys.has(key))) excluded = not;
+        // A custom refiner can replace item schemas during emission. Keep the existing
+        // scalar negations for that mode without assuming their nested parsers are exact.
+        const isExact =
+            resolver?.supportsSchemaRefSiblings && !options?.schemaRefiner
+                ? hasExactRawParser(not, resolver, options)
+                : keys.every((key) => exactNegationKeys.has(key));
+        if (isExact) excluded = not;
     }
 
     const shouldExcludeNull = acceptsNull(not, resolver) === true;

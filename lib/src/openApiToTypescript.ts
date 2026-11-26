@@ -2,6 +2,7 @@ import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t, ts } from "tanu";
 import type { TypeDefinition, TypeDefinitionObject } from "tanu/dist/type";
 
+import { arrayProjection } from "./arrayProjection";
 import generateJSDocArray from "./generateJSDocArray";
 import { isReferenceObject } from "./isReferenceObject";
 import type { DocumentResolver } from "./makeSchemaResolver";
@@ -88,7 +89,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
     const isInline = !inheritedMeta?.name;
 
     const builtinType = (
-        name: "Array" | "File" | "Readonly" | "ReadonlyArray" | "Record" | "Exclude",
+        name: "Array" | "File" | "Readonly" | "ReadonlyArray" | "Record" | "Exclude" | "Extract",
         args?: TypeDefinition[]
     ) => t.reference(ctx?.resolver.resolveSchemaName(name) ? `globalThis.${name}` : name, args);
     const doWrapReadOnly = (theType: MaybeWrapReadOnlyType) =>
@@ -138,7 +139,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
         const withoutNull = (value: TypeDefinition) =>
             t.intersection([value, t.union([ts.factory.createTypeLiteralNode([]), t.undefined()])]);
-        const negated = schemaNegation(schema, ctx?.resolver);
+        const negated = schemaNegation(schema, ctx?.resolver, options);
         if (negated) {
             const value = branchType(negated.positive);
             if (negated.excludesNull === undefined) return value as ts.TypeNode;
@@ -146,40 +147,79 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
             return t.intersection([value, negated.excludesNull ? present : t.union([present, t.reference("null")])]);
         }
 
+        const projected = (operands: Array<SchemaObject | ReferenceObject>, types: TypeDefinition[]) => {
+            const all = t.intersection(types);
+            const plan =
+                !options?.schemaRefiner && arrayProjection(operands, ctx?.resolver, isReferenceObject(schema), options);
+            if (!plan || !ctx) return all;
+            ctx.hasDistinctInput = true;
+            if (ctx.input) return all;
+            const array = builtinType("ReadonlyArray", [t.unknown()]);
+            const producers = types.flatMap((type, i) => {
+                if (!plan.contributes[i]) return [];
+                const items = plan.itemTypes[i];
+                return [items ? branchType({ type: "array", items }) : builtinType("Extract", [type, array])];
+            });
+            const items = producers.map((producer) =>
+                ts.factory.createIndexedAccessTypeNode(t.intersection([producer]), t.number())
+            );
+            const output =
+                producers.length === 1
+                    ? t.intersection(producers)
+                    : builtinType(options?.allReadonly ? "ReadonlyArray" : "Array", [
+                          items.length > 0 ? t.intersection(items) : t.unknown(),
+                      ]);
+            if (plan.isArrayOnly) return output;
+            const nonArray = plan.isArrayOrNull
+                ? t.reference("null")
+                : t.union([
+                      t.string(),
+                      t.number(),
+                      t.boolean(),
+                      t.reference("null"),
+                      t.undefined(),
+                      t.intersection([
+                          t.reference("object"),
+                          t.type("", { "[globalThis.Symbol.iterator]": t.optional(t.never()) }).type,
+                      ]),
+                  ]);
+            return t.union([output, t.intersection([all, nonArray])]);
+        };
+
         const parts = schemaAssertionParts(schema, ctx?.resolver);
         if (parts) {
-            return t.intersection(
-                intersectionOperands(parts, ctx?.resolver, false).map((part, index) => {
-                    if (
-                        index > 0 &&
-                        (hasStructuralLiteral(part) || (isReferenceObject(schema) && hasStructuralKeywords(part))) &&
-                        ctx
-                    ) {
-                        ctx.hasDistinctInput = true;
-                        if (!ctx.input) return t.unknown();
-                    }
+            const operands = intersectionOperands(parts, ctx?.resolver, false);
+            const types = operands.map((part, index) => {
+                if (
+                    index > 0 &&
+                    (hasStructuralLiteral(part) || (isReferenceObject(schema) && hasStructuralKeywords(part))) &&
+                    ctx
+                ) {
+                    ctx.hasDistinctInput = true;
+                    if (!ctx.input) return t.unknown();
+                }
 
-                    if (
-                        index > 0 &&
-                        (part.type === "object" || (Array.isArray(part.type) && part.type.includes("object"))) &&
-                        !part.properties &&
-                        !part.required &&
-                        !part.enum &&
-                        !Object.hasOwn(part, "const") &&
-                        !part.additionalProperties
-                    ) {
-                        const types = (Array.isArray(part.type) ? part.type : [part.type]).map((kind) =>
-                            kind === "object"
-                                ? builtinType("Record", [t.string(), t.unknown()])
-                                : branchType({ ...part, type: kind })
-                        );
-                        if (part.nullable && acceptsNull(part, ctx?.resolver)) types.push(t.reference("null"));
-                        return t.union(types);
-                    }
+                if (
+                    index > 0 &&
+                    (part.type === "object" || (Array.isArray(part.type) && part.type.includes("object"))) &&
+                    !part.properties &&
+                    !part.required &&
+                    !part.enum &&
+                    !Object.hasOwn(part, "const") &&
+                    !part.additionalProperties
+                ) {
+                    const types = (Array.isArray(part.type) ? part.type : [part.type]).map((kind) =>
+                        kind === "object"
+                            ? builtinType("Record", [t.string(), t.unknown()])
+                            : branchType({ ...part, type: kind })
+                    );
+                    if (part.nullable && acceptsNull(part, ctx?.resolver)) types.push(t.reference("null"));
+                    return t.union(types);
+                }
 
-                    return branchType(part);
-                })
-            );
+                return branchType(part);
+            });
+            return "allOf" in schema && schema.allOf ? projected(operands, types) : t.intersection(types);
         }
 
         if (isReferenceObject(schema)) {
@@ -223,12 +263,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
 
         if (Array.isArray(schema.type)) {
             if (schema.type.length === 1) {
-                return emitTypescript({
-                    schema: { ...schema, type: schema.type[0]! },
-                    ctx,
-                    meta,
-                    options,
-                });
+                return emitTypescript({ schema: { ...schema, type: schema.type[0]! }, ctx, meta, options });
             }
 
             const hasArrayAlternative = schema.type.includes("array") && ctx?.resolver.supportsSchemaRefSiblings;
@@ -272,8 +307,7 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         if (schema.oneOf) {
             const types = schema.oneOf.map(branchType);
             const union = compositionType(t.union(types), types);
-            const domain =
-                !options?.schemaRefiner && structuralOneOfDomain(structuralOneOfOverlaps(schema.oneOf, ctx?.resolver));
+            const domain = structuralOneOfDomain(structuralOneOfOverlaps(schema.oneOf, ctx?.resolver, options));
             if (!domain) return union;
             const object = t.reference("object");
             const allowedObject = domain.allowsArrays
@@ -298,13 +332,8 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
         }
 
         if (schema.allOf) {
-            return compositionType(
-                schema.allOf.length > 0
-                    ? t.intersection(
-                          intersectionOperands(schema.allOf, ctx?.resolver, !options?.schemaRefiner).map(branchType)
-                      )
-                    : t.unknown()
-            );
+            const operands = intersectionOperands(schema.allOf, ctx?.resolver, !options?.schemaRefiner);
+            return compositionType(operands.length > 0 ? projected(operands, operands.map(branchType)) : t.unknown());
         }
 
         const schemaType = schema.type ? (schema.type.toLowerCase() as NonNullable<typeof schema.type>) : undefined;
@@ -408,9 +437,16 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                     const hasDefault =
                         options?.withDefaultValues !== false &&
                         useSiteDefault(propSchema, ctx?.resolver, undefined, !!options?.schemaRefiner);
-                    if (ctx && isRequired && hasDefault) ctx.hasDistinctInput = true;
+                    // A partial object wraps every property in optional(), outside its default.
+                    // A checked optional reference may also leave a missing property undefined.
+                    const requiredOutput =
+                        isRequired ||
+                        (hasDefault &&
+                            !hasDefault.needsCheck &&
+                            (schema.required?.length || options?.withImplicitRequiredProps));
+                    if (ctx && hasDefault && requiredOutput) ctx.hasDistinctInput = true;
 
-                    if (!isRequired || (ctx?.input && hasDefault)) {
+                    if (!requiredOutput || (ctx?.input && hasDefault)) {
                         const optional = t.optional(propType);
                         if (options?.withDocs) {
                             // Tanu transfers outer comments to the property. The union factory
