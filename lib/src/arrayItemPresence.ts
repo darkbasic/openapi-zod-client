@@ -2,30 +2,42 @@ import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t, ts } from "tanu";
 
 import type { DocumentResolver } from "./makeSchemaResolver";
-import { requiredAdditionalKeys } from "./schemaAssertions";
+import { positiveDoubleNegation, requiredAdditionalKeys } from "./schemaAssertions";
 
 type Schema = ReferenceObject | SchemaObject;
 
-// This is only a list of places where a presence check might help. The generated
-// input and output types below decide whether the check really applies.
+// Locate item contracts that can narrow a parsed result. The generated input and
+// output types decide whether each constraint applies, including across unions.
 type Presence = {
     keys: string[];
+    hasScalarConstraint: boolean;
     items?: Presence | undefined;
 };
+
+// A whole-array enum can constrain scalar entries several levels down. Object
+// literals constrain the raw object only; the owning parser may strip its keys.
+function literalItems(values: unknown[]): Presence | undefined {
+    const children: unknown[] = values.filter(Array.isArray).flat();
+    if (children.length === 0) return;
+    const hasScalarConstraint = children.some((value) => value === null || typeof value !== "object");
+    const items = literalItems(children);
+    return hasScalarConstraint || items ? { keys: [], hasScalarConstraint, items } : undefined;
+}
+
+function merge(nodes: Presence[]): Presence | undefined {
+    if (nodes.length <= 1) return nodes[0];
+    return {
+        keys: [...new Set(nodes.flatMap((node) => node.keys))],
+        hasScalarConstraint: nodes.some((node) => node.hasScalarConstraint),
+        items: merge(nodes.flatMap((node) => node.items ?? [])),
+    };
+}
 
 export function arrayPresenceCandidates(operands: Schema[], contributes: boolean[], resolver: DocumentResolver) {
     const guards = new Map<Schema, Presence | undefined>();
     const producers = new Map<Schema, Presence | undefined>();
     const visiting = new Set<Schema>();
     let hasRecursiveItems = false;
-    const merge = (nodes: Presence[]): Presence | undefined => {
-        if (nodes.length <= 1) return nodes[0];
-        return {
-            keys: [...new Set(nodes.flatMap((node) => node.keys))],
-            items: merge(nodes.flatMap((node) => node.items ?? [])),
-        };
-    };
-
     const visit = (schema: Schema, isGuard: boolean): Presence | undefined => {
         const cache = isGuard ? guards : producers;
         if (cache.has(schema)) return cache.get(schema);
@@ -35,18 +47,24 @@ export function arrayPresenceCandidates(operands: Schema[], contributes: boolean
         }
 
         visiting.add(schema);
-        const { $ref, allOf, anyOf, oneOf, items, ...local }: SchemaObject & { $ref?: string } = { ...schema };
+        const { $ref, allOf, anyOf, oneOf, items, ...local }: SchemaObject & { $ref?: string; const?: unknown } = {
+            ...(positiveDoubleNegation(schema) ?? schema),
+        };
         // A producer already types its declared properties. A reference sibling
         // checks the raw input and can supply an independent presence guarantee.
         const isAssertion = isGuard || !!$ref;
         const keys = (isAssertion ? local.required ?? [] : requiredAdditionalKeys(local)).filter(
             (key) => key !== "__proto__"
         );
+        const literals = Object.hasOwn(local, "const") ? [local.const] : local.enum;
+        const hasScalarConstraint = isAssertion && (!!local.type || !!literals);
         const child = items && visit(items, isAssertion);
+        const literalChild = isAssertion && literals && literalItems(literals);
         const ref = $ref && resolver.getSchemaByRef($ref);
         const branches = [...(allOf ?? []), ...(anyOf ?? []), ...(oneOf ?? []), ...(ref ? [ref] : [])];
         const result = merge([
-            ...(keys.length > 0 || child ? [{ keys, items: child }] : []),
+            ...(keys.length > 0 || hasScalarConstraint || child ? [{ keys, hasScalarConstraint, items: child }] : []),
+            ...(literalChild ? [{ keys: [], hasScalarConstraint: false, items: literalChild }] : []),
             ...branches.flatMap((branch) => visit(branch, isGuard) ?? []),
         ]);
         visiting.delete(schema);
@@ -65,8 +83,15 @@ const keyof = (type: ts.TypeNode) => f.createTypeOperatorNode(ts.SyntaxKind.KeyO
 const conditional = f.createConditionalTypeNode;
 const param = (name: string, constraint?: ts.TypeNode) => f.createTypeParameterDeclaration(undefined, name, constraint);
 const array = t.reference("globalThis.ReadonlyArray", [t.unknown()]);
+// A broad union arm such as unknown or {} accepts an array with arbitrary
+// elements, even though Extract would omit that arm.
 const elements = (value: ts.TypeNode) =>
-    f.createIndexedAccessTypeNode(t.reference("globalThis.Extract", [value, array]), t.number());
+    conditional(
+        t.reference("globalThis.Array", [t.unknown()]),
+        value,
+        t.unknown(),
+        f.createIndexedAccessTypeNode(t.reference("globalThis.Extract", [value, array]), t.number())
+    );
 const present = t.union([f.createTypeLiteralNode([]), t.reference("null")]);
 
 // A guard can narrow a retained field's presence, never replace its parsed type.
@@ -103,9 +128,31 @@ function presentFields(item: ts.TypeNode, input: ts.TypeNode, names: string[], r
     );
 }
 
+const jsonScalars = t.union([t.string(), t.number(), t.boolean()]);
+
+function scalarConstraint(input: ts.TypeNode): ts.TypeNode {
+    // A default can produce a different value from undefined. Otherwise a
+    // scalar keeps its value, whereas an object can lose keys or gain defaults.
+    // A broad non-null input ({}) also admits scalar values.
+    return conditional(
+        t.undefined(),
+        input,
+        t.unknown(),
+        conditional(
+            input,
+            t.reference("object"),
+            conditional(jsonScalars, input, f.createTypeLiteralNode([]), t.reference("object")),
+            input
+        )
+    );
+}
+
 function applyPresence(value: ts.TypeNode, guards: ItemGuard[], readonly: boolean): ts.TypeNode {
     const item = t.reference("Item");
     const names = guards.map((_, i) => "Input" + i);
+    const scalars = guards.flatMap(({ proof }, i) =>
+        proof.hasScalarConstraint ? [scalarConstraint(t.reference(names[i]!))] : []
+    );
     const fields = guards.flatMap(({ proof }, i) =>
         proof.keys.length > 0 ? [presentFields(item, t.reference(names[i]!), proof.keys, readonly)] : []
     );
@@ -138,7 +185,7 @@ function applyPresence(value: ts.TypeNode, guards: ItemGuard[], readonly: boolea
     return conditional(
         f.createTupleTypeNode([value, ...guards.map(({ input }) => input)]),
         f.createTupleTypeNode(["Item", ...names].map((name) => f.createInferTypeNode(param(name)))),
-        conditional(item, array, nested, object),
+        t.intersection([conditional(item, array, nested, object), ...scalars]),
         t.never()
     );
 }
@@ -154,5 +201,18 @@ export function arrayOutputType(
     const item: ts.TypeNode = items.length > 0 ? t.intersection(items) : t.unknown();
     const guards = candidates.flatMap((proof, i) => (proof ? [{ proof, input: elements(rawArray(i)) }] : []));
     const output = guards.length > 0 ? applyPresence(item, guards, readonly) : item;
-    return t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [output]);
+    const list = t.reference(readonly ? "globalThis.ReadonlyArray" : "globalThis.Array", [output]);
+    // Intersecting a fixed tuple with the narrowed element list preserves its
+    // length and positional types while array methods use the narrowed elements.
+    return t.intersection([
+        list,
+        ...producers.map((producer) =>
+            conditional(
+                t.number(),
+                f.createIndexedAccessTypeNode(producer, f.createLiteralTypeNode(f.createStringLiteral("length"))),
+                t.unknown(),
+                producer
+            )
+        ),
+    ]);
 }

@@ -45,6 +45,8 @@ test.each(["3.0.3", "3.1.0"])("negates the effective constraints of a reference 
         HasMarker: { ...ref("AnyValue"), type: "array", contains: { const: "marker" } },
         WithoutMarker: { not: ref("HasMarker") },
         RestoredObject: { not: { not: { type: "object" } } },
+        RestoredRef: { not: { not: { ...ref("TextValue"), not: { not: { type: "integer" } } } } },
+        TextValue: { type: "string" },
         Holder: {
             type: "object",
             properties: {
@@ -78,6 +80,7 @@ test.each(["3.0.3", "3.1.0"])("negates the effective constraints of a reference 
     expect(client.schemas.WithoutLongText!.safeParse("ab").success).toBe(false);
     // The generated positive validator approximates "contains". Inverting it would reject valid arrays.
     expect(client.schemas.WithoutMarker!.safeParse(["other"]).success).toBe(supportsSiblings);
+    expect(client.schemas.RestoredRef!.safeParse("text").success).toBe(openapi === "3.0.3");
     expect(client.schemas.RestoredObject!._def.typeName).toBe("ZodObject");
     expect(client.schemas.Holder!.safeParse({}).success).toBe(false);
     if (supportsSiblings) {

@@ -8,6 +8,7 @@ import { isReferenceObject } from "./isReferenceObject";
 import { type SchemaInput, normalizeBooleanSchema } from "./normalizeBooleanSchema";
 import { getZodChainableStringValidations, numberBounds } from "./scalarBounds";
 import {
+    type RawStructuralAssertion,
     finiteStructuralAlternatives,
     getSchemaReferenceChain,
     hasImpossibleRequiredKey,
@@ -191,6 +192,15 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
         return needsCompositionBranchNull(operand, ctx?.resolver) ? value + ".nullable()" : value;
     };
 
+    const rawCode = (plan: RawStructuralAssertion) =>
+        rawAssertionCode(plan, (scalar) => {
+            // The raw check only uses JSON scalar constraints and type tags. Object
+            // configuration controls the ordinary parser, including its produced value.
+            const rawOptions = { ...options, strictObjects: false, additionalPropertiesDefaultValue: true };
+            const value = emitZodSchema({ schema: scalar, ctx, meta, options: rawOptions }).toString();
+            return needsCompositionBranchNull(scalar, ctx?.resolver) ? value + ".nullable()" : value;
+        });
+
     if (conditional) return code.assign(guardInput(branchCode(conditional.base), branchCode(conditional.allowed)));
 
     const finite = finiteStructuralAlternatives(schema, ctx?.resolver, options);
@@ -209,7 +219,7 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             ? "globalThis.NonNullable<unknown>"
             : "(globalThis.NonNullable<unknown> | null)";
         const present = negated.excludesNull ? "value != null" : 'typeof value !== "undefined"';
-        const rule = negated.excluded ? branchCode(negated.excluded) : "null";
+        const rule = negated.raw ? rawCode(negated.raw) : negated.excluded ? branchCode(negated.excluded) : "null";
         return code.assign(`((base, rule: z.ZodTypeAny | null) => z.custom<z.input<typeof base> & ${type}>(
             (value) => ${present} && !rule?.safeParse(value).success)
             .pipe(base).refine((value): value is typeof value & ${type} => ${present}))(${base}, ${rule})`);
@@ -276,7 +286,20 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
         }
 
         if (projection) {
-            const array = arrayProjectionCode(projection, refs, expression, !!options?.allReadonly, branchCode);
+            const choices = new Map<SchemaObject, ReturnType<typeof planOneOf>>();
+            const array = arrayProjectionCode(
+                projection,
+                refs,
+                expression,
+                !!options?.allReadonly,
+                (branch, choice, index) => {
+                    const parser = branchCode(branch);
+                    if (!choice || index === undefined) return parser;
+                    const plan = choices.get(choice) ?? planOneOf(choice, ctx, options);
+                    choices.set(choice, plan);
+                    return oneOfOption(parser, plan, index, rawCode);
+                }
+            );
             return code.assign(`((${refs.join(", ")}) => ${array})(${parsers.join(", ")})`);
         }
 
@@ -367,38 +390,16 @@ function emitZodSchema({ schema: $schema, ctx, meta: inheritedMeta, options }: C
             return assignComposition(type.toString());
         }
 
-        let types = schema.oneOf.map(branchCode);
-        if (schema.discriminator) {
-            const propertyName = schema.discriminator.propertyName;
-            const usedTags = new Set<unknown>();
-            const branches = schema.oneOf.map((option) =>
-                discriminatorOption(option, propertyName, usedTags, ctx, options)
-            );
-            const key = JSON.stringify(propertyName);
-            const readonly = options?.allReadonly ? ".readonly()" : "";
-            if (branches.every((branch) => branch?.canDispatch)) {
-                const objects = options?.allReadonly ? types.map((type) => `${type}.unwrap()`) : types;
-                return assignComposition(`
-                z.discriminatedUnion(${key}, [${objects.join(", ")}])${readonly}
+        const types = schema.oneOf.map(branchCode);
+        const plan = planOneOf(schema, ctx, options);
+        if (plan.canDispatch) {
+            const objects = options?.allReadonly ? types.map((type) => `${type}.unwrap()`) : types;
+            return assignComposition(`
+                z.discriminatedUnion(${plan.key}, [${objects.join(", ")}])${options?.allReadonly ? ".readonly()" : ""}
             `);
-            }
-
-            if (branches.some((branch) => branch?.needsTagCheck)) {
-                // A plain union sees defaults during parsing. Discriminator dispatch checks the raw tag first.
-                const skipTag = ctx?.resolver.supportsSchemaRefSiblings
-                    ? "z.getParsedType(value) !== z.ZodParsedType.object"
-                    : "value === null";
-                types = types.map((type, index) =>
-                    branches[index]?.needsTagCheck
-                        ? `((schema) => z.custom<z.input<typeof schema>>((value) => ${skipTag} || (value !== undefined && value[${key}] !== undefined)).pipe(schema))(${type})`
-                        : type
-                );
-            }
         }
 
-        const union = `z.union([${types.join(", ")}])`;
-        const overlaps = structuralOneOfOverlaps(schema.oneOf, ctx?.resolver, options);
-        return assignComposition(guardStructuralOneOf(union, overlaps));
+        return assignComposition(guardStructuralOneOf(types, plan, rawCode));
     }
 
     // anyOf accepts a value matching at least one branch; it does not imply an array.
@@ -572,8 +573,116 @@ function getDictionaryValueSchema({ schema, ctx, meta, options }: ConversionArgs
     return applyUseSite(value, { schema, ctx, meta: { ...meta, isRequired: true }, options }, "dictionaryEntry");
 }
 
-function guardStructuralOneOf(union: string, overlaps: ReturnType<typeof structuralOneOfOverlaps>) {
-    if (overlaps.length === 0) return union;
+function rawAssertionCode(
+    { steps, root }: RawStructuralAssertion,
+    scalarCode: (schema: SchemaObject) => string
+): string {
+    const declarations = steps.map((step, i) => {
+        const assertions: string[] = [];
+        const declarations: string[] = [];
+        if (Object.keys(step.scalar).length > 0) {
+            declarations.push(`const scalar${i} = ${scalarCode(step.scalar)};`);
+            assertions.push(`scalar${i}.safeParse(value).success`);
+        }
+
+        if (step.items !== undefined)
+            assertions.push(
+                `(z.getParsedType(value) !== z.ZodParsedType.array || (value as unknown[]).every(check${step.items}))`
+            );
+        if (step.required.length > 0 || step.properties.length > 0 || step.additional !== undefined) {
+            const checks = step.required.map((key) => `({}).hasOwnProperty.call(object, ${JSON.stringify(key)})`);
+            if (step.properties.length > 0 || step.additional !== undefined) {
+                const extra =
+                    typeof step.additional === "number"
+                        ? `check${step.additional}(object[key])`
+                        : String(step.additional !== false);
+                const fields = step.properties.map(([key, rule]) => `[${JSON.stringify(key)}]: check${rule}`);
+                declarations.push(
+                    `const fields${i}: globalThis.Record<string, (value: unknown) => boolean> = { ${fields.join(
+                        ", "
+                    )} };`
+                );
+                checks.push(`z.util.objectKeys(object).every((key) => ({}).hasOwnProperty.call(fields${i}, key)
+                    ? fields${i}[key]!(object[key]) : ${extra})`);
+            }
+
+            declarations.push(
+                `const object${i} = (object: globalThis.Record<string, unknown>) => ${checks.join(" && ")};`
+            );
+            assertions.push(
+                `(z.getParsedType(value) !== z.ZodParsedType.object || object${i}(value as globalThis.Record<string, unknown>))`
+            );
+        }
+
+        assertions.push(...step.all.map((rule) => `check${rule}(value)`));
+        if (step.any)
+            assertions.push("(" + (step.any.map((rule) => `check${rule}(value)`).join(" || ") || "false") + ")");
+        if (step.one) {
+            const rules = step.one.map((rule) => `check${rule}`);
+            assertions.push(
+                rules.length > 0 ? `[${rules.join(", ")}].filter((check) => check(value)).length === 1` : "false"
+            );
+        }
+
+        if (step.not !== undefined) assertions.push(`!check${step.not}(value)`);
+        declarations.push(
+            assertions.length > 0
+                ? `const check${i} = (value: unknown): boolean => ${assertions.join(" && ")};`
+                : `const check${i} = (_value: unknown) => true;`
+        );
+        return declarations.join("\n");
+    });
+    return `(() => { ${declarations.join("\n")} return z.custom(check${root}); })()`;
+}
+
+// Validation and array output selection must dispatch the same alternatives.
+function planOneOf(schema: SchemaObject, ctx: ConversionArgs["ctx"], options: ConversionArgs["options"]) {
+    const members = schema.oneOf!;
+    const property = schema.discriminator?.propertyName;
+    const usedTags = new Set<unknown>();
+    const tags =
+        property === undefined
+            ? []
+            : members.map((member) => discriminatorOption(member, property, usedTags, ctx, options));
+    const canDispatch = tags.length > 0 && tags.every((tag) => tag?.canDispatch);
+    const overlaps = canDispatch ? [] : structuralOneOfOverlaps(members, ctx?.resolver, options);
+    return {
+        key: JSON.stringify(property),
+        tags,
+        canDispatch,
+        overlaps,
+        refSiblings: ctx?.resolver.supportsSchemaRefSiblings,
+    };
+}
+
+type OneOfPlan = ReturnType<typeof planOneOf>;
+
+function oneOfOption(
+    parser: string,
+    plan: OneOfPlan,
+    index: number,
+    emitRaw: (proof: RawStructuralAssertion, index: number) => string
+) {
+    if (plan.tags[index]?.needsTagCheck) {
+        const skip = plan.refSiblings ? "z.getParsedType(value) !== z.ZodParsedType.object" : "value === null";
+        parser = `((option) => z.custom<z.input<typeof option>>((value) =>
+            ${skip} || (value !== undefined && value[${plan.key}] !== undefined)).pipe(option))(${parser})`;
+    }
+
+    const active = plan.overlaps.flatMap(({ kind, checks }) => {
+        const proof = checks.find((check) => check.index === index)?.raw;
+        return proof ? [{ kind, proof }] : [];
+    });
+    if (active.length === 0) return parser;
+    const outside = active.map(({ kind }) => `z.getParsedType(value) !== z.ZodParsedType.${kind}`).join(" && ");
+    return `((option, raw) => z.custom<z.input<typeof option>>((value) =>
+        (${outside}) || raw.safeParse(value).success).pipe(option))(${parser}, ${emitRaw(active[0]!.proof, index)})`;
+}
+
+function guardStructuralOneOf(options: string[], plan: OneOfPlan, rawCode: (plan: RawStructuralAssertion) => string) {
+    const { overlaps } = plan;
+    if (overlaps.length === 0)
+        return `z.union([${options.map((option, i) => oneOfOption(option, plan, i, rawCode)).join(", ")}])`;
     const excluded = overlaps.filter(({ always }) => always > 1);
     const domain = structuralOneOfDomain(overlaps);
     const allowedType =
@@ -585,8 +694,16 @@ function guardStructuralOneOf(union: string, overlaps: ReturnType<typeof structu
             "undefined",
         ].join(" | ");
     const allowedOutput = excluded.map(({ kind }) => `z.getParsedType(value) !== z.ZodParsedType.${kind}`).join(" && ");
+    const declarations = new Map<number, string>();
+    const rawRef = (proof: RawStructuralAssertion, index: number) => {
+        const name = "raw" + index;
+        if (!declarations.has(index)) declarations.set(index, `const ${name} = ${rawCode(proof)};`);
+        return name;
+    };
+
+    const parsers = options.map((_, i) => oneOfOption(`options[${i}]`, plan, i, rawRef));
     const cases = overlaps.map(({ kind, always, checks }) => {
-        const rules = checks.map((i) => `schema.options[${i}]`);
+        const rules = checks.map(({ index, raw }) => (raw ? rawRef(raw, index) : `schema.options[${index}]`));
         const unique =
             always > 1
                 ? "false"
@@ -597,9 +714,15 @@ function guardStructuralOneOf(union: string, overlaps: ReturnType<typeof structu
     });
     const input = allowedType ? `z.input<typeof schema> & (${allowedType})` : "z.input<typeof schema>";
     const narrow = allowedType ? `.refine((value): value is typeof value & (${allowedType}) => ${allowedOutput})` : "";
-    return `((schema) => z.custom<${input}>((value) => {
+    const guarded = `z.custom<${input}>((value) => {
         switch (z.getParsedType(value)) { ${cases.join("\n")} default: return true; }
-    }).pipe(schema)${narrow})(${union})`;
+    }).pipe(schema)${narrow}`;
+    return declarations.size > 0 || plan.tags.some((tag) => tag?.needsTagCheck)
+        ? `((options) => { ${Array.from(declarations.values()).join("\n")} const schema = z.union([${parsers.join(
+              ", "
+          )}]);
+            return ${guarded}; })([${options.join(", ")}] as const)`
+        : `((schema) => ${guarded})(z.union([${options.join(", ")}]))`;
 }
 
 // Check the supplied value before the base schema strips keys or fills defaults.

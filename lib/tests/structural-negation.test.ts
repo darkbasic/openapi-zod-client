@@ -159,6 +159,90 @@ test("matches JSON Schema 2020-12 for negated item predicates with and without r
     }
 });
 
+test.each([false, true])(
+    "selects structural array alternatives on the supplied JSON (explicit/readonly: %s)",
+    async (explicit) => {
+        const oracle = new Ajv2020({ strict: false });
+        const x = { properties: { x: integer } };
+        const y: SchemaObject = { properties: { y: { type: "string" } } };
+        const choice = { oneOf: [arrayOf(x), arrayOf(y)] };
+        const excluding = { items: x, not: { required: ["x"] } };
+        const defaulting = (key: string): SchemaObject => ({
+            required: [key],
+            additionalProperties: false,
+            properties: { [key]: { ...integer, default: 1 }, label: { type: "string", default: key } },
+        });
+        const { client, source } = await generate(
+            {
+                Choice: choice,
+                Excluding: excluding,
+                X: x,
+                Rows: arrayOf(ref("X")),
+                Referenced: { oneOf: [ref("Rows"), arrayOf(y)] },
+                Wrapped: { oneOf: [arrayOf({ anyOf: [{ oneOf: [ref("X")] }] }), arrayOf({ not: { not: y } })] },
+                Double: { oneOf: [{ not: { not: x } }, x] },
+                ObjectChoice: arrayOf({ oneOf: [ref("X"), { type: "object" }] }),
+                NotOne: { ...arrayOf(x), not: { oneOf: [x, { type: "string" }] } },
+                NotAny: { ...arrayOf(x), not: { anyOf: [arrayOf(x), { type: "string" }] } },
+                Left: defaulting("x"),
+                Right: defaulting("y"),
+                First: { oneOf: [arrayOf(ref("Left")), arrayOf(ref("Right"))] },
+                Last: { oneOf: [arrayOf(ref("Right")), arrayOf(ref("Left"))] },
+                Any: { oneOf: [{ anyOf: [arrayOf(ref("Left")), { type: "boolean" }] }, arrayOf(ref("Right"))] },
+                One: { oneOf: [{ oneOf: [arrayOf(ref("Left")), { type: "boolean" }] }, arrayOf(ref("Right"))] },
+                Not: { oneOf: [{ allOf: [arrayOf(ref("Left")), { not: { type: "null" } }] }, arrayOf(ref("Right"))] },
+                Closed: { not: { allOf: [ref("Left"), { properties: { x: { minimum: 2 } } }] } },
+                Own: { not: { required: ["__proto__"], properties: { ["__proto__"]: integer } } },
+            },
+            explicit
+        );
+        for (const [rule, names] of [
+            [choice, ["Choice", "Referenced", "Wrapped"]],
+            [excluding, ["Excluding"]],
+        ] as const) {
+            const validate = oracle.compile(rule);
+            for (const input of [
+                null,
+                "t",
+                {},
+                { x: 2 },
+                [],
+                [1],
+                [[]],
+                [{}],
+                [{ x: "s" }],
+                [{ y: 2 }],
+                [{ x: "s", y: 2 }],
+            ]) {
+                for (const name of names)
+                    expect(client[name]!.safeParse(input).success, name + " on " + JSON.stringify(input)).toBe(
+                        validate(input)
+                    );
+            }
+        }
+        for (const value of [1, [], [1], false]) expect(client.Double!.safeParse(value).success).toBe(false);
+        expect(client.ObjectChoice!.safeParse([1, {}]).success).toBe(false);
+        expect(client.ObjectChoice!.parse([1, { x: "s" }])).toEqual([1, { x: "s" }]);
+        for (const parser of [client.NotOne!, client.NotAny!]) expect(parser.safeParse([1]).success).toBe(false);
+        for (const parser of [client.First!, client.Last!, client.Any!, client.One!, client.Not!]) {
+            expect(parser.safeParse([{}]).success).toBe(false);
+            expect(parser.safeParse([{ x: 2, y: 3 }]).success).toBe(false);
+            for (const key of ["x", "y"]) {
+                const parsed = parser.parse([{ [key]: 2 }]);
+                expect(parsed).toEqual([{ [key]: 2, label: key }]);
+                expect(Object.isFrozen(parsed)).toBe(explicit);
+            }
+        }
+        for (const value of [{}, { x: 1 }, { x: 2, other: 1 }]) expect(client.Closed!.parse(value)).toEqual(value);
+        expect(client.Closed!.safeParse({ x: 2 }).success).toBe(false);
+        expect(client.Own!.safeParse({}).success).toBe(true);
+        expect(client.Own!.safeParse(JSON.parse('{"__proto__":1}')).success).toBe(false);
+        expect(client.Own!.safeParse(JSON.parse('{"__proto__":"x"}')).success).toBe(true);
+        expect(typeErrors(source)).toEqual([]);
+    },
+    30_000
+);
+
 test("keeps unresolved and approximate item assertions out of negation and overlap proofs", async () => {
     const approximate = [
         arrayOf({ type: "array", contains: { const: 1 } }),
@@ -189,6 +273,7 @@ test("respects parser options when determining which predicates can be inverted"
     const { client } = await generate(
         {
             Restricted: { ...rules, not: arrayOf({ not: { type: "object" } }) },
+            Optional: { ...rules, not: arrayOf({ properties: { label: { type: "string" } } }) },
             Integers: { ...rules, not: arrayOf(integer) },
         },
         false,
@@ -196,6 +281,9 @@ test("respects parser options when determining which predicates can be inverted"
         { strictObjects: true, additionalPropertiesDefaultValue: false, withImplicitRequiredProps: true }
     );
     expect(client.Restricted!.parse([{ id: 1 }])).toEqual([{ id: 1 }]);
+    expect(client.Optional!.safeParse([{}]).success).toBe(false);
+    expect(client.Optional!.safeParse([{ other: true }]).success).toBe(false);
+    expect(client.Optional!.parse([{ label: false }])).toEqual([{ label: false }]);
     expect(client.Integers!.safeParse([1]).success).toBe(false);
 
     const { client: refined } = await generate(

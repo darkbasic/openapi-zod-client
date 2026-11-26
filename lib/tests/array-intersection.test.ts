@@ -56,11 +56,58 @@ test.each([false, true])(
             [{ type: "array", items: { minLength: 1 } }, rule, false],
             [{ type: "array", items: { type: "object" } }, rule, false],
             [{ anyOf: [{ type: "array" }, { type: "boolean" }] }, rule, false],
+            [second, { not: { not: ref("Rule") } }, true],
         ];
         for (const [i, [a, b]] of cases.entries()) {
             schemas["First" + i] = { allOf: [a, b] };
             schemas["Last" + i] = { allOf: [b, a] };
         }
+        schemas.Choice = {
+            oneOf: [
+                { type: "array", items: { required: ["x"], properties: { x: { type: "integer", default: 1 } } } },
+                { type: "array", items: { required: ["y"] } },
+            ],
+        };
+        schemas.SelectedRows = {
+            allOf: [
+                ref("Choice"),
+                {
+                    type: "array",
+                    items: { type: "object", properties: { y: { type: "integer" } }, additionalProperties: false },
+                },
+            ],
+        };
+        schemas.ClosedObject = {
+            items: { type: "integer" },
+            not: { not: { type: "object", properties: { id: { type: "integer" } }, additionalProperties: false } },
+        };
+        schemas.CheckedRows = {
+            allOf: [
+                { type: "array", minItems: 2 },
+                {
+                    type: "array",
+                    items: {
+                        ...item,
+                        properties: {
+                            ...item.properties,
+                            choice: { anyOf: [{ type: "integer" }, { type: "string" }] },
+                        },
+                    },
+                },
+            ],
+        };
+        schemas.Form = { type: "object", properties: { rows: ref("CheckedRows") } };
+        schemas.NestedEnum = {
+            type: "object",
+            properties: {
+                tags: {
+                    allOf: [
+                        { type: "array", items: { type: "string", enum: ["only"] } },
+                        { type: "array", items: { type: "string", default: "only" } },
+                    ],
+                },
+            },
+        };
         schemas.Conflict = {
             allOf: [
                 rule,
@@ -152,6 +199,39 @@ test.each([false, true])(
         expect(client.First4!.safeParse([{ tag: "ok" }]).success).toBe(false);
         expect(client.Last7!.safeParse([{ tag: "x" }]).success).toBe(false);
         expect(client.Conflict!.safeParse([{ tag: "ok" }]).success).toBe(false);
+        expect(client.SelectedRows!.parse([{ y: 2, extra: 3 }])).toEqual([{ y: 2 }]);
+        expect(client.ClosedObject!.parse({ id: 1, extra: "discard" })).toEqual({ id: 1 });
+        expect(client.CheckedRows!.safeParse("wrong")).toMatchObject({
+            success: false,
+            error: {
+                issues: [expect.objectContaining({ code: "invalid_type", expected: "array", received: "string" })],
+            },
+        });
+        expect(client.CheckedRows!.safeParse([{}], { errorMap: () => ({ message: "localized" }) })).toMatchObject({
+            success: false,
+            error: {
+                issues: [
+                    expect.objectContaining({ code: "too_small", minimum: 2, path: [], message: "localized" }),
+                    expect.objectContaining({ code: "invalid_type", path: [0, "tag"], message: "localized" }),
+                ],
+            },
+        });
+        const invalid = client.Form!.safeParse(
+            { rows: [{ tag: "a", choice: false }, { tag: "b" }] },
+            {
+                errorMap: () => ({ message: "localized" }),
+            }
+        );
+        expect(invalid.error?.format()).toEqual({
+            _errors: [],
+            rows: { _errors: [], 0: { _errors: [], choice: { _errors: ["localized", "localized"] } } },
+        });
+        expect(client.NestedEnum!.safeParse({ tags: ["only", "other"] })).toMatchObject({
+            success: false,
+            error: {
+                issues: [expect.objectContaining({ code: "invalid_literal", expected: "only", path: ["tags", 1] })],
+            },
+        });
         expect(client.PartialItem!.parse({})).toEqual({});
         expect(
             typeErrors(

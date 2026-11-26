@@ -222,8 +222,8 @@ export function oneOfNullGuard(schema: SchemaObject, resolver?: DocumentResolver
 }
 
 const scalarKinds = ["boolean", "number", "string"] as const;
-const nonObjectKinds = ["array", ...scalarKinds] as const;
-type NonObjectKind = typeof nonObjectKinds[number];
+const instanceKinds = ["object", "array", ...scalarKinds] as const;
+type InstanceKind = typeof instanceKinds[number];
 const keywordDomains = new Map(
     Object.entries({
         object: [
@@ -266,7 +266,8 @@ export function getConjunctiveSchemaLayers(
     const complete = new Set<Schema>();
     const visit = (branch: Schema): boolean => {
         if (complete.has(branch)) return true;
-        const { $ref, ...siblings }: SchemaAssertions = { ...branch };
+        const positive = positiveDoubleNegation(branch, !!resolver.supportsSchemaRefSiblings);
+        const { $ref, ...siblings }: SchemaAssertions = { ...(positive ?? branch) };
         const applicable: SchemaObject = $ref && !resolver.supportsSchemaRefSiblings ? {} : siblings;
         const { oneOf, anyOf, allOf, ...assertions } = applicable;
         const local: SchemaObject = assertions;
@@ -301,6 +302,89 @@ function canProveKeyword(schema: SchemaObject, key: string) {
         exactNegationKeys.has(key) ||
         (key === "pattern" && schema.pattern !== undefined && !hasLegacyPatternDelimiters(schema.pattern))
     );
+}
+
+// Prove the raw membership of object/array operands independently of the parser
+// which produces their value. Each distinct child/target contributes at most one
+// step. Unsupported assertions and recursive re-entry retain the ordinary fallback.
+type RawAssertionStep = {
+    scalar: SchemaObject;
+    required: string[];
+    properties: Array<[string, number]>;
+    additional: false | number | undefined;
+    items: number | undefined;
+    all: number[];
+    any: number[] | undefined;
+    one: number[] | undefined;
+    not: number | undefined;
+};
+
+export type RawStructuralAssertion = {
+    steps: RawAssertionStep[];
+    root: number;
+    hasUntyped: boolean;
+    hasStructure: boolean;
+};
+
+// Only a closed object or an additional-value schema needs an extra check.
+function rawAdditional(rule: SchemaObject["additionalProperties"], visit: (schema: Schema) => number) {
+    if (typeof rule === "object") return visit(rule);
+    return rule === false ? false : undefined;
+}
+
+function rawStructuralAssertion(schema: Schema, resolver: DocumentResolver): RawStructuralAssertion | undefined {
+    const steps: RawAssertionStep[] = [];
+    const seen = new Map<Schema, number>();
+    let hasStructure = false;
+    let hasUntyped = false;
+    let isExact = true;
+    const unresolved = () => {
+        isExact = false;
+        return -1;
+    };
+
+    const visit = (node: Schema): number => {
+        if (!isExact) return -1;
+        const known = seen.get(node);
+        if (known === -1) return unresolved();
+        if (known !== undefined) return known;
+        // Re-entering a node with no completed step means the proof is cyclic.
+        seen.set(node, -1);
+        const local: SchemaAssertions = { ...(positiveDoubleNegation(node) ?? node) };
+        const { $ref, properties, required, additionalProperties, items, allOf, anyOf, oneOf, not, ...rest } = local;
+        const entries = Object.entries(rest).filter(([key]) => !nonAssertionKeys.has(key) && !key.startsWith("x-"));
+        if (!entries.every(([key]) => canProveKeyword(rest, key))) return unresolved();
+        const target = $ref ? resolver.getSchemaByRef($ref) : undefined;
+        if ($ref && !target) return unresolved();
+
+        const hasLocalStructure = hasStructuralKeywords(local);
+        hasStructure ||= hasLocalStructure;
+        hasUntyped ||= hasLocalStructure && !rest.type;
+        const layers = [...(allOf ?? []), ...(target ? [target] : [])];
+        const all = [...new Set(layers.map(visit))];
+        if (all.length === 1 && !anyOf && !oneOf && !not && entries.length === 0 && !hasLocalStructure) {
+            seen.set(node, all[0]!);
+            return all[0]!;
+        }
+
+        const step: RawAssertionStep = {
+            scalar: Object.fromEntries(entries),
+            required: required ?? [],
+            all,
+            any: anyOf?.map(visit),
+            one: oneOf?.map(visit),
+            not: not && visit(not),
+            properties: Object.entries(properties ?? {}).map(([key, child]) => [key, visit(child)]),
+            items: items && visit(items),
+            additional: rawAdditional(additionalProperties, visit),
+        };
+        const index = steps.push(step) - 1;
+        seen.set(node, index);
+        return index;
+    };
+
+    const root = visit(schema);
+    return isExact ? { steps, root, hasUntyped, hasStructure } : undefined;
 }
 
 // Only use a generated parser as an assertion on raw JSON when all applicable keywords
@@ -361,7 +445,7 @@ type KindMatch = "always" | "never" | "check" | "unknown";
 
 function localKindMatch(
     local: SchemaObject,
-    kind: NonObjectKind,
+    kind: InstanceKind,
     resolver: DocumentResolver,
     options?: TemplateContext["options"]
 ): KindMatch {
@@ -405,15 +489,17 @@ function alternativeMatch(matches: KindMatch[], exclusive: boolean): KindMatch {
     return possible.includes("unknown") ? "unknown" : "check";
 }
 
-function nonObjectMatch(
+function instanceMatch(
     branch: Schema,
-    kind: NonObjectKind,
+    kind: InstanceKind,
     resolver: DocumentResolver,
     options?: TemplateContext["options"]
 ) {
     const refs = new Map<string, KindMatch>();
     let hasStructural = false;
     const visit = (schema: Schema): KindMatch => {
+        const positive = positiveDoubleNegation(schema);
+        if (positive) return visit(positive);
         const conditional = lowerStructuralConditional(schema, resolver);
         if (conditional) {
             hasStructural = true;
@@ -424,7 +510,8 @@ function nonObjectMatch(
         hasStructural ||= !local.type && hasStructuralKeywords(local);
         const matches = [localKindMatch(local, kind, resolver, options)];
         if (not) {
-            const excluded = hasExactRawParser(not, resolver, options) ? visit(not) : "unknown";
+            const candidate = visit(not);
+            const excluded = hasExactRawParser(not, resolver, options) ? candidate : "unknown";
             matches.push(excluded === "always" ? "never" : excluded === "never" ? "always" : excluded);
         }
 
@@ -449,20 +536,49 @@ function nonObjectMatch(
     return { match, hasStructural };
 }
 
+function optionMatch(
+    { match, hasStructural }: ReturnType<typeof instanceMatch>,
+    kind: InstanceKind,
+    branch: Schema,
+    rawFor: (schema: Schema) => RawStructuralAssertion | undefined
+) {
+    const plan =
+        match !== "never" && (match === "unknown" || kind === "object" || kind === "array")
+            ? rawFor(branch)
+            : undefined;
+    // An object parser may supply or strip fields. Check its raw membership before dispatch.
+    const raw = match === "unknown" || kind === "object" ? plan : undefined;
+    return {
+        match: raw ? "check" : match,
+        hasStructural: hasStructural || (kind === "array" && plan?.hasUntyped),
+        raw,
+    };
+}
+
 // Untyped structural options also match values outside the domain of their keywords.
-// Keep the ordinary union on object inputs (its parsing policy includes defaults and stripping).
+// Use raw object dispatch only when all potentially matching options are understood.
 export function structuralOneOfOverlaps(
     branches: Schema[],
     resolver?: DocumentResolver,
     options?: TemplateContext["options"]
 ) {
     if (!resolver?.supportsSchemaRefSiblings || options?.schemaRefiner) return [];
-    return nonObjectKinds.flatMap((kind) => {
-        const matches = branches.map((branch) => nonObjectMatch(branch, kind, resolver, options));
+    const plans = new Map<Schema, RawStructuralAssertion | undefined>();
+    const rawFor = (branch: Schema) => {
+        if (!plans.has(branch)) plans.set(branch, rawStructuralAssertion(branch, resolver));
+        return plans.get(branch);
+    };
+
+    return instanceKinds.flatMap((kind) => {
+        const candidates = branches.map((branch) => instanceMatch(branch, kind, resolver, options));
+        if (candidates.filter(({ match }) => match !== "never").length < 2) return [];
+        if (kind !== "array" && !candidates.some(({ hasStructural }) => hasStructural)) return [];
+        const matches = candidates.map((candidate, i) => optionMatch(candidate, kind, branches[i]!, rawFor));
+        if (kind === "object" && matches.some(({ match, raw }) => match !== "never" && !raw)) return [];
         if (!matches.some(({ hasStructural, match }) => hasStructural && (match === "always" || match === "check")))
             return [];
         const always = matches.filter(({ match }) => match === "always").length;
-        const checks = matches.flatMap(({ match }, i) => (match === "check" ? [i] : []));
+        const checks = matches.flatMap(({ match, raw }, index) => (match === "check" ? [{ index, raw }] : []));
         return always + checks.length >= 2 ? [{ kind, always, checks }] : [];
     });
 }
@@ -473,6 +589,19 @@ export function structuralOneOfDomain(overlaps: ReturnType<typeof structuralOneO
     const excluded = new Set(overlaps.filter(({ always }) => always > 1).map(({ kind }) => kind));
     if (excluded.size === 0) return;
     return { allowsArrays: !excluded.has("array"), scalars: scalarKinds.filter((kind) => !excluded.has(kind)) };
+}
+
+// This generator parses a double negation with its positive schema. Use the same
+// representation when determining which array items and required keys survive parsing.
+export function positiveDoubleNegation(schema: Schema, supportsRefSiblings = true): Schema | undefined {
+    if (!supportsRefSiblings && isReferenceObject(schema)) return;
+    if (!("not" in schema) || !schema.not || !("not" in schema.not)) return;
+    const inner = schema.not.not;
+    if (!inner || Object.keys(schema.not).length !== 1) return;
+    const base = { ...schema };
+    delete base.not;
+    const positive = positiveDoubleNegation(inner, supportsRefSiblings) ?? inner;
+    return Object.keys(base).length > 0 ? { allOf: [base, positive] } : positive;
 }
 
 export function schemaNegation(schema: Schema, resolver?: DocumentResolver, options?: TemplateContext["options"]) {
@@ -493,9 +622,8 @@ export function schemaNegation(schema: Schema, resolver?: DocumentResolver, opti
     const { not, ...positive } = local;
     // Negating a permissive approximation (e.g. an unimplemented contains) rejects valid data.
     // Only invert predicates the positive validator implements exactly. Other predicates can still decide the null case.
-    if ("not" in not && not.not && Object.keys(not).length === 1) {
-        return { positive: Object.keys(positive).length > 0 ? { allOf: [positive, not.not] } : not.not };
-    }
+    const doubleNegation = positiveDoubleNegation(schema, !!resolver?.supportsSchemaRefSiblings);
+    if (doubleNegation) return { positive: doubleNegation };
 
     const chain = getSchemaReferenceChain(not, resolver);
     const target = chain.at(-1)!;
@@ -515,6 +643,10 @@ export function schemaNegation(schema: Schema, resolver?: DocumentResolver, opti
                 ? hasExactRawParser(not, resolver, options)
                 : keys.every((key) => exactNegationKeys.has(key));
         if (isExact) excluded = not;
+        else if (resolver?.supportsSchemaRefSiblings && !options?.schemaRefiner) {
+            const raw = rawStructuralAssertion(not, resolver);
+            if (raw?.hasStructure) return { positive, raw, excludesNull: acceptsNull(not, resolver) === true };
+        }
     }
 
     const shouldExcludeNull = acceptsNull(not, resolver) === true;

@@ -4,7 +4,7 @@ import { t } from "tanu";
 import { arrayOutputType, arrayPresenceCandidates } from "./arrayItemPresence";
 import type { DocumentResolver } from "./makeSchemaResolver";
 import { printTs } from "./printTs";
-import { getConjunctiveSchemaLayers, hasStructuralKeywords } from "./schemaAssertions";
+import { getConjunctiveSchemaLayers, hasStructuralKeywords, positiveDoubleNegation } from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
 
 type Schema = ReferenceObject | SchemaObject;
@@ -19,8 +19,12 @@ type Decision =
     | { items: Decision }
     | { recursive: Decision }
     | { some: Decision[] }
-    | { scope: Scope; options: Array<{ schema: Schema; decision: Decision }> };
-type Emit = (schema: Schema) => string;
+    | {
+          scope: Scope;
+          oneOf: SchemaObject | undefined;
+          options: Array<{ schema: Schema; index: number; decision: Decision }>;
+      };
+type Emit = (schema: Schema, oneOf?: SchemaObject, index?: number) => string;
 
 const combine = (decisions: Decision[]): Decision => {
     if (decisions.includes(true)) return true;
@@ -36,15 +40,16 @@ function unionDecision(
     alternatives: Schema[],
     scope: Scope,
     visit: (schema: Schema, scope: Scope) => Decision,
-    resolver: DocumentResolver
+    resolver: DocumentResolver,
+    oneOf?: SchemaObject
 ): Decision {
-    const possible =
-        scope === "array"
-            ? alternatives.filter((member) => !getConjunctiveSchemaLayers(member, resolver, true)?.some(excludesArrays))
-            : alternatives;
-    const choices = possible.map((schema) => ({ schema, decision: visit(schema, scope) }));
+    const choices = alternatives.flatMap((schema, index) =>
+        scope === "array" && getConjunctiveSchemaLayers(schema, resolver, true)?.some(excludesArrays)
+            ? []
+            : [{ schema, index, decision: visit(schema, scope) }]
+    );
     const first = choices[0]?.decision ?? false;
-    return choices.every((choice) => choice.decision === first) ? first : { scope, options: choices };
+    return choices.every((choice) => choice.decision === first) ? first : { scope, options: choices, oneOf };
 }
 
 function objectDecision(schema: SchemaObject, options?: TemplateContext["options"]): Decision {
@@ -66,7 +71,9 @@ function memberDecision(
     resolver: DocumentResolver,
     options?: TemplateContext["options"]
 ): Decision {
-    const { $ref, allOf, anyOf, oneOf, ...local }: SchemaObject & { $ref?: string } = { ...schema };
+    const { $ref, allOf, anyOf, oneOf, ...local }: SchemaObject & { $ref?: string } = {
+        ...(positiveDoubleNegation(schema) ?? schema),
+    };
     const decisions: Decision[] = [];
     if (scope === "item" && options?.withDefaultValues !== false && local.default !== undefined)
         decisions.push("default");
@@ -84,9 +91,8 @@ function memberDecision(
     }
 
     if (allOf) decisions.push(...allOf.map((member) => visit(member, scope)));
-    for (const alternatives of [anyOf, oneOf]) {
-        if (alternatives) decisions.push(unionDecision(alternatives, scope, visit, resolver));
-    }
+    if (anyOf) decisions.push(unionDecision(anyOf, scope, visit, resolver));
+    if (oneOf) decisions.push(unionDecision(oneOf, scope, visit, resolver, { ...local, oneOf }));
 
     return combine(decisions);
 }
@@ -148,7 +154,13 @@ export function arrayProjection(
     // A concrete array can reference its own elements. A conditional Extract around
     // the same recursive alias would be an illegal circular type declaration.
     const itemTypes = members.map((layers) => {
-        if (!layers || layers.some((layer) => layer.oneOf ?? layer.anyOf ?? layer.allOf)) return;
+        if (
+            !layers ||
+            layers.some(
+                (layer) => layer.oneOf ?? layer.anyOf ?? layer.allOf ?? layer.enum ?? Object.hasOwn(layer, "const")
+            )
+        )
+            return;
         const items = layers.flatMap((layer) => (layer.items ? [layer.items] : []));
         return items.length === 1 ? items[0] : undefined;
     });
@@ -189,7 +201,7 @@ function arraySelectors(plan: Projection, emit: Emit) {
             const owned = ownership(option.decision) + "(item)";
             if (i === decision.options.length - 1) return owned;
             const name = `option${rules.length}`;
-            rules.push(emit(option.schema));
+            rules.push(emit(option.schema, decision.oneOf, option.index));
             const check = `${name}.safeParse(${decision.scope === "array" ? "value" : "item"}).success`;
             if (decision.scope === "item") return `(${check} ? ${owned} : ${otherwise})`;
             const cached = `matches${arrayChecks.length}`;
@@ -220,20 +232,25 @@ function arraySelectors(plan: Projection, emit: Emit) {
     return { owners, rules, selectors, arrayChecks, combineMasks };
 }
 
+// Dispatch without cloning the input array. Keep the native array error on a type mismatch.
+function arrayInput(refs: string[]) {
+    const input = refs.map((ref) => `z.input<typeof ${ref}>`).join(" & ");
+    return `z.custom<${input}>().superRefine((value, ctx) => {
+        const received = z.getParsedType(value);
+        if (received !== z.ZodParsedType.array) ctx.addIssue({ code: "invalid_type", expected: "array", received, fatal: true });
+    })`;
+}
+
 function selectedArray(plan: Projection, refs: string[], emit: Emit, readonly: boolean) {
     const { owners, rules, selectors, arrayChecks, combineMasks } = arraySelectors(plan, emit);
-    const input = refs.map((ref) => `z.input<typeof ${ref}>`).join(" & ");
-    const parse = `z.custom<${input}>((value) => z.getParsedType(value) === z.ZodParsedType.array)
-        .transform((value, ctx): unknown => {
+    // Parse each operand in Zod's current context. Distinct keys keep its result
+    // available for selection without asking Zod to merge it with another operand.
+    const members = refs.map((ref, i) => `.and(${ref}.transform(data => ({ part${i}: data })))`).join("");
+    const parse = `${arrayInput(refs)}.pipe(z.unknown().transform(value => ({ value }))${members})
+        .transform((parts, ctx): unknown => {
             const asArray = (value: unknown): value is readonly unknown[] => z.getParsedType(value) === z.ZodParsedType.array;
-            if (!asArray(value)) return z.NEVER;
-            const parsed: (readonly unknown[])[] = [];
-            for (const member of [${refs.join(", ")}]) {
-                const result = member.safeParse(value);
-                if (!result.success) { for (const issue of result.error.issues) ctx.addIssue(issue); return z.NEVER; }
-                if (!asArray(result.data)) { ctx.addIssue({ code: "custom" }); return z.NEVER; }
-                parsed.push(result.data);
-            }
+            const { value } = parts;
+            const parsed = [${refs.map((_, i) => `parts.part${i}`).join(", ")}];
             type Mask = boolean | ((item: unknown) => Mask);
             ${combineMasks}
             ${arrayChecks.join("\n")}
@@ -256,7 +273,7 @@ function selectedArray(plan: Projection, refs: string[], emit: Emit, readonly: b
                 }
                 const merged = owned.map(keep).reduce((a, b) => a.and(b)).safeParse(undefined);
                 if (merged.success) return merged.data;
-                for (const issue of merged.error.issues) ctx.addIssue({ ...issue, path: [...path, ...issue.path] });
+                ctx.addIssue({ code: "invalid_intersection_types", path });
                 return z.NEVER;
             };
             const owners = [${owners.join(", ")}];
@@ -277,19 +294,26 @@ export function arrayProjectionCode(plan: Projection, refs: string[], other: str
         array = selectedArray(plan, refs, emit, readonly);
     } else {
         const guards = refs.filter((_, i) => !plan.contributes[i]);
-        const checks = [isArray, ...guards.map((guard) => `${guard}.safeParse(value).success`)].join(" && ");
         const parser = producers.reduce((left, right) => `${left}.and(${right})`);
-        const parse =
-            readonly && producers.length > 1
-                ? `.transform((input, ctx) => {
-            const result = ${parser}.safeParse(input);
-            if (!result.success) { for (const issue of result.error.issues) ctx.addIssue(issue); return z.NEVER; }
-            ${freezeMerged}
-            freeze(result.data, input);
-            return result.data;
-        })`
-                : `.pipe(${parser})`;
-        array = `z.custom<${input}>((value) => ${checks})${parse}`;
+        const shouldFreeze = readonly && producers.length > 1;
+        // Run guards as native intersections. Their empty outputs cannot restore
+        // stripped fields; Zod retains nested issue paths and the caller's error map.
+        let validated = shouldFreeze ? "z.unknown().transform(raw => ({ raw }))" : "";
+        for (const guard of guards) {
+            const empty = `${guard}.transform(() => ({}))`;
+            validated = validated ? `${validated}.and(${empty})` : empty;
+        }
+
+        array =
+            arrayInput(refs) +
+            ".pipe(" +
+            (validated
+                ? `${validated}.and(${parser}.transform(data => ({ data }))).transform(parts => {
+                ${shouldFreeze ? freezeMerged + "\nfreeze(parts.data, parts.raw);" : ""}
+                return parts.data;
+            })`
+                : parser) +
+            ")";
     }
 
     const outputs = producers.map((ref) =>
@@ -298,7 +322,10 @@ export function arrayProjectionCode(plan: Projection, refs: string[], other: str
     const output = printTs(
         arrayOutputType(outputs, plan.presence, (i) => t.reference(`z.input<typeof ${refs[i]}>`), readonly)
     );
-    array += `.refine((value): value is ${output} => ${isArray})`;
+    // Only narrow successful parses: a failed transform may carry an internal
+    // intermediate value, which must not produce another validation issue.
+    array = `((parser) => parser.pipe(z.custom<z.output<typeof parser>>().refine((value): value is ${output} =>
+        ${isArray})))(${array})`;
     const otherType = plan.presence.some(Boolean)
         ? "globalThis.Exclude<typeof value, readonly unknown[]>"
         : "typeof value";
