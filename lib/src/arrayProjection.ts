@@ -1,6 +1,9 @@
 import type { ReferenceObject, SchemaObject } from "openapi3-ts";
+import { t } from "tanu";
 
+import { arrayOutputType, arrayPresenceCandidates } from "./arrayItemPresence";
 import type { DocumentResolver } from "./makeSchemaResolver";
+import { printTs } from "./printTs";
 import { getConjunctiveSchemaLayers, hasStructuralKeywords } from "./schemaAssertions";
 import type { TemplateContext } from "./template-context";
 
@@ -149,7 +152,8 @@ export function arrayProjection(
         const items = layers.flatMap((layer) => (layer.items ? [layer.items] : []));
         return items.length === 1 ? items[0] : undefined;
     });
-    return { decisions, contributes, isDynamic, isArrayOnly, isArrayOrNull, itemTypes };
+    const presence = arrayPresenceCandidates(operands, contributes, resolver);
+    return { decisions, contributes, isDynamic, isArrayOnly, isArrayOrNull, itemTypes, presence };
 }
 
 type Projection = NonNullable<ReturnType<typeof arrayProjection>>;
@@ -288,13 +292,18 @@ export function arrayProjectionCode(plan: Projection, refs: string[], other: str
         array = `z.custom<${input}>((value) => ${checks})${parse}`;
     }
 
-    const outputs = producers.map((ref) => `globalThis.Extract<z.output<typeof ${ref}>, readonly unknown[]>`);
-    const arrayType = readonly ? "globalThis.ReadonlyArray" : "globalThis.Array";
-    const items = outputs.map((output) => output + "[number]").join(" & ");
-    const output = outputs.length === 1 ? outputs[0] : `${arrayType}<${items || "unknown"}>`;
+    const outputs = producers.map((ref) =>
+        t.reference(`globalThis.Extract<z.output<typeof ${ref}>, readonly unknown[]>`)
+    );
+    const output = printTs(
+        arrayOutputType(outputs, plan.presence, (i) => t.reference(`z.input<typeof ${refs[i]}>`), readonly)
+    );
     array += `.refine((value): value is ${output} => ${isArray})`;
+    const otherType = plan.presence.some(Boolean)
+        ? "globalThis.Exclude<typeof value, readonly unknown[]>"
+        : "typeof value";
     return plan.isArrayOnly
         ? array
         : `${array}.or(z.custom<${input}>((value) => !(${isArray})).pipe(${other})
-        .refine((value): value is typeof value & (string | number | boolean | null | undefined | (object & { [globalThis.Symbol.iterator]?: never })) => !(${isArray})))`;
+        .refine((value): value is ${otherType} & (string | number | boolean | null | undefined | (object & { [globalThis.Symbol.iterator]?: never })) => !(${isArray})))`;
 }

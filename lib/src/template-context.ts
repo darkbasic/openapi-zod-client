@@ -10,12 +10,9 @@ import { getZodiosEndpointDefinitionList } from "./getZodiosEndpointDefinitionLi
 import type { TsConversionContext } from "./openApiToTypescript";
 import { getTypescriptFromOpenApi } from "./openApiToTypescript";
 import { getZodSchema } from "./openApiToZod";
+import { printTs } from "./printTs";
 import { topologicalSort } from "./topologicalSort";
 import { asComponentSchema, normalizeString } from "./utils";
-
-const file = ts.createSourceFile("", "", ts.ScriptTarget.ESNext, true);
-const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
-const printTs = (node: ts.Node) => printer.printNode(ts.EmitHint.Unspecified, node, file);
 
 export const getZodClientTemplateContext = (
     openApiDoc: OpenAPIObject,

@@ -2,6 +2,7 @@ import type { ReferenceObject, SchemaObject } from "openapi3-ts";
 import { t, ts } from "tanu";
 import type { TypeDefinition, TypeDefinitionObject } from "tanu/dist/type";
 
+import { arrayOutputType } from "./arrayItemPresence";
 import { arrayProjection } from "./arrayProjection";
 import generateJSDocArray from "./generateJSDocArray";
 import { isReferenceObject } from "./isReferenceObject";
@@ -160,15 +161,18 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                 const items = plan.itemTypes[i];
                 return [items ? branchType({ type: "array", items }) : builtinType("Extract", [type, array])];
             });
-            const items = producers.map((producer) =>
-                ts.factory.createIndexedAccessTypeNode(t.intersection([producer]), t.number())
+            const output = arrayOutputType(
+                producers.map((producer) => t.intersection([producer])),
+                plan.presence,
+                (i) =>
+                    emitTypescript({
+                        schema: operands[i]!,
+                        ctx: { ...ctx, input: true },
+                        meta,
+                        options,
+                    }) as ts.TypeNode,
+                !!options?.allReadonly
             );
-            const output =
-                producers.length === 1
-                    ? t.intersection(producers)
-                    : builtinType(options?.allReadonly ? "ReadonlyArray" : "Array", [
-                          items.length > 0 ? t.intersection(items) : t.unknown(),
-                      ]);
             if (plan.isArrayOnly) return output;
             const nonArray = plan.isArrayOrNull
                 ? t.reference("null")
@@ -183,7 +187,8 @@ TsConversionArgs): ts.Node | TypeDefinitionObject | string => {
                           t.type("", { "[globalThis.Symbol.iterator]": t.optional(t.never()) }).type,
                       ]),
                   ]);
-            return t.union([output, t.intersection([all, nonArray])]);
+            const other = plan.presence.some(Boolean) ? builtinType("Exclude", [all, array]) : all;
+            return t.union([output, t.intersection([other, nonArray])]);
         };
 
         const parts = schemaAssertionParts(schema, ctx?.resolver);

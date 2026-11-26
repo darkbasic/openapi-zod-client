@@ -176,6 +176,86 @@ const optional: z.output<typeof PartialItem> = {};
     30_000
 );
 
+test.each([false, true])(
+    "array projection preserves validated keys on parsed items (readonly/explicit %s)",
+    async (readonly) => {
+        const item: SchemaObject = {
+            type: "object",
+            properties: { id: { type: "integer" } },
+            additionalProperties: false,
+        };
+        const required: SchemaObject = { type: "object", required: ["id", "raw"] };
+        const rows = (items: SchemaObject): SchemaObject => ({ type: "array", items });
+        const intersect = (...allOf: SchemaObject[]): SchemaObject => ({ allOf });
+        const schemas = {
+            RecursiveRows: intersect(rows({ anyOf: [ref("RecursiveRows"), item] }), rows({ required: ["id"] })),
+            Items: rows(item),
+            Guard: rows(required),
+            Result: intersect(ref("Items"), ref("Guard")),
+            Reversed: intersect(ref("Guard"), ref("Items")),
+            Nested: intersect(
+                rows(ref("Items")),
+                rows(rows({ ...item, properties: { label: { type: "string" } } })),
+                rows(ref("Guard")),
+                rows(rows({ required: ["label"] }))
+            ),
+            Dictionary: intersect(rows({ type: "object", additionalProperties: { type: "string" } }), rows(required)),
+            Optional: intersect(rows(item), rows({ anyOf: [required, { type: "object" }] })),
+            DeclaredGuard: { ...ref("Items"), allOf: [{}], items: { ...item, required: ["id"] } },
+            Defaulted: rows({ ...item, default: {} }),
+            DefaultedGuard: { ...ref("Defaulted"), allOf: [{}], items: { ...required, default: { id: 1, raw: true } } },
+        };
+        const source = await generateZodClientFromOpenAPI({
+            openApiDoc: {
+                openapi: "3.1.0",
+                info: { title: "Required keys", version: "1" },
+                paths: {},
+                components: { schemas },
+            },
+            options: { shouldExportAllSchemas: true, shouldExportAllTypes: readonly, allReadonly: readonly },
+            disableWriteToFile: true,
+        });
+        const { outputText } = transpileModule(source, {
+            compilerOptions: { module: ModuleKind.CommonJS, target: ScriptTarget.ES2020 },
+        });
+        const client: Record<string, z.ZodTypeAny> = new Function(
+            "require",
+            "exports",
+            outputText + "\nreturn exports.schemas;"
+        )(createRequire(import.meta.url), {});
+        for (const parser of [client.Result!, client.Reversed!]) {
+            expect(parser.parse([{ id: 1, raw: true }])).toEqual([{ id: 1 }]);
+            expect(parser.safeParse([{ raw: true }]).success).toBe(false);
+        }
+        expect(client.Nested!.parse([[{ id: 1, label: "ok", raw: true }]])).toEqual([[{ id: 1, label: "ok" }]]);
+        expect(client.Optional!.parse([{}])).toEqual([{}]);
+        expect(client.DefaultedGuard!.parse([undefined])).toEqual([{}]);
+        expect(
+            typeErrors(
+                source +
+                    `
+const recursive: z.output<typeof RecursiveRows> = [[{ id: 1 }], []];
+const row = Result.parse([])[0]!;
+const id: number = row.id;
+const reverseId: number = Reversed.parse([])[0]!.id;
+const declaredId: number = DeclaredGuard.parse([])[0]!.id;
+const nested: [number, string][] = Nested.parse([])[0]!.map(row => [row.id, row.label]);
+const dictionaryId: string = Dictionary.parse([])[0]!.id;
+// @ts-expect-error the producer strips this key
+const stripped = row.raw;
+// @ts-expect-error a union branch accepts an object without id
+const optional: number = Optional.parse([])[0]!.id;
+// @ts-expect-error the guard can validate its own item default
+const defaulted: number = DefaultedGuard.parse([undefined])[0]!.id;
+${readonly ? "// @ts-expect-error parsed readonly rows cannot be mutated" : ""}
+row.id = 2;
+`
+            )
+        ).toEqual([]);
+    },
+    30_000
+);
+
 test("visits shared conjunctive references once per analysis", () => {
     const schemas: Record<string, SchemaObject> = { N0: { items: { type: "object", additionalProperties: false } } };
     for (let i = 1; i <= 12; i++) schemas["N" + i] = { allOf: [ref("N" + (i - 1)), ref("N" + (i - 1))] };
